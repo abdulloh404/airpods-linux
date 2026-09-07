@@ -1,0 +1,1 @@
+savedcmd_/home/abdulloh/github.com/airpods-linux/kernel/airpods-power/modules.order := {   echo /home/abdulloh/github.com/airpods-linux/kernel/airpods-power/airpods_power.o; :; } > /home/abdulloh/github.com/airpods-linux/kernel/airpods-power/modules.order

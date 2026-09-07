@@ -10,6 +10,8 @@ use std::{
 pub const SAMPLE_RATE: u32 = 64_000;
 /// จำนวน channel ของ virtual microphone
 pub const CHANNELS: u8 = 1;
+pub const SOURCE_NAME: &str = "Microphone_Virtual_Abdullohs_AirPods_Pro";
+pub const SOURCE_DESCRIPTION: &str = "Microphone virtual - Abdulloh's AirPods Pro";
 /// gain เริ่มต้นก่อนเข้า limiter
 pub const DEFAULT_GAIN_DB: f32 = 18.0;
 /// limiter เริ่มต้นหน่วย dBFS
@@ -89,8 +91,8 @@ pub struct AudioConfig {
 impl Default for AudioConfig {
     fn default() -> Self {
         Self {
-            node_name: "AirPodsHiRes".to_string(),
-            node_description: "AirPods Hi-Res Microphone".to_string(),
+            node_name: SOURCE_NAME.to_string(),
+            node_description: SOURCE_DESCRIPTION.to_string(),
             gain_db: DEFAULT_GAIN_DB,
             limiter_dbfs: DEFAULT_LIMITER_DBFS,
             queue_capacity_ms: 250,

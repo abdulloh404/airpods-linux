@@ -2,7 +2,7 @@
 
 use std::time::Duration;
 
-use airpods_audio::{AudioConfig, AudioEngine};
+use airpods_audio::{AudioConfig, AudioEngine, PushOutcome};
 use airpods_core::aacp::AacpSession;
 use airpods_core::framing::{demux_audio_sdu, is_audio_sdu};
 use anyhow::Context;
@@ -10,10 +10,21 @@ use tokio::sync::{mpsc, watch};
 
 use crate::service::{DesiredAudio, Event, SharedState};
 
+const FIRST_AUDIO_TIMEOUT: Duration = Duration::from_secs(3);
+const AUDIO_STALL_TIMEOUT: Duration = Duration::from_secs(3);
+const DECODE_ERROR_LIMIT: u32 = 64;
+const QUEUE_FULL_LIMIT: u32 = 256;
+const CLEANUP_TIMEOUT: Duration = Duration::from_secs(1);
+
 enum AttemptExit {
     Reconfigure,
     Shutdown,
     Failed(String),
+}
+
+enum StartAudioExit {
+    Completed(anyhow::Result<()>),
+    Cancelled(AttemptExit),
 }
 
 pub async fn lifecycle_loop(
@@ -161,18 +172,41 @@ async fn stream_once(
         let _ = engine.stop();
         return exit;
     }
-    if let Err(error) = session.start_audio().await {
-        let _ = engine.stop();
-        return AttemptExit::Failed(error.to_string());
+    let start = tokio::select! {
+        result = session.start_audio() => StartAudioExit::Completed(result),
+        changed = desired.changed() => {
+            let exit = if changed.is_err() {
+                AttemptExit::Shutdown
+            } else {
+                AttemptExit::Reconfigure
+            };
+            StartAudioExit::Cancelled(exit)
+        }
+        _ = shutdown.changed() => StartAudioExit::Cancelled(AttemptExit::Shutdown),
+    };
+    match start {
+        StartAudioExit::Completed(Ok(())) => {}
+        StartAudioExit::Completed(Err(error)) => {
+            stop_stream(&mut session, &mut engine).await;
+            return AttemptExit::Failed(error.to_string());
+        }
+        StartAudioExit::Cancelled(exit) => {
+            stop_stream(&mut session, &mut engine).await;
+            return exit;
+        }
     }
     if let Some(exit) = stale_startup(desired, shutdown, &target) {
-        let _ = session.stop_audio().await;
-        let _ = engine.stop();
+        stop_stream(&mut session, &mut engine).await;
         return exit;
     }
 
     set_audio_status(state, events, "streaming", true, 0, None).await;
     let mut packet = vec![0_u8; 65_535];
+    let stream_started = tokio::time::Instant::now();
+    let mut last_queued_audio: Option<tokio::time::Instant> = None;
+    let mut decode_errors = 0_u32;
+    let mut queue_full = 0_u32;
+    let mut watchdog = tokio::time::interval(Duration::from_millis(500));
     let outcome = 'stream: loop {
         tokio::select! {
             changed = desired.changed() => {
@@ -195,6 +229,15 @@ async fn stream_once(
                     break AttemptExit::Shutdown;
                 }
             }
+            _ = watchdog.tick() => {
+                let timed_out = match last_queued_audio {
+                    Some(last_audio) => last_audio.elapsed() >= AUDIO_STALL_TIMEOUT,
+                    None => stream_started.elapsed() >= FIRST_AUDIO_TIMEOUT,
+                };
+                if timed_out {
+                    break AttemptExit::Failed("AirPods microphone stream produced no usable audio for 3 seconds".to_string());
+                }
+            }
             received = session.recv(&mut packet) => {
                 let received = match received {
                     Ok(0) => break AttemptExit::Failed("AirPods disconnected".to_string()),
@@ -210,18 +253,45 @@ async fn stream_once(
                     Err(error) => break AttemptExit::Failed(error.to_string()),
                 };
                 for access_unit in access_units {
-                    if let Err(error) = engine.push_access_unit(access_unit) {
-                        break 'stream AttemptExit::Failed(error.to_string());
+                    match engine.push_access_unit(access_unit) {
+                        Ok(PushOutcome::Queued) => {
+                            last_queued_audio = Some(tokio::time::Instant::now());
+                            decode_errors = 0;
+                            queue_full = 0;
+                        }
+                        Ok(PushOutcome::DecodeError) => {
+                            decode_errors = decode_errors.saturating_add(1);
+                            queue_full = 0;
+                            if decode_errors >= DECODE_ERROR_LIMIT {
+                                break 'stream AttemptExit::Failed(
+                                    "AAC-ELD decoder rejected 64 consecutive access units".to_string(),
+                                );
+                            }
+                        }
+                        Ok(PushOutcome::QueueFull) => {
+                            decode_errors = 0;
+                            queue_full = queue_full.saturating_add(1);
+                            if queue_full >= QUEUE_FULL_LIMIT {
+                                break 'stream AttemptExit::Failed(
+                                    "PipeWire audio queue remained full for 256 access units".to_string(),
+                                );
+                            }
+                        }
+                        Err(error) => break 'stream AttemptExit::Failed(error.to_string()),
                     }
                 }
             }
         }
     };
 
-    let _ = session.stop_audio().await;
-    let _ = engine.stop();
+    stop_stream(&mut session, &mut engine).await;
     set_audio_status(state, events, "stopping", false, 0, None).await;
     outcome
+}
+
+async fn stop_stream(session: &mut AacpSession, engine: &mut AudioEngine) {
+    let _ = tokio::time::timeout(CLEANUP_TIMEOUT, session.stop_audio()).await;
+    let _ = engine.stop();
 }
 
 fn stale_startup(

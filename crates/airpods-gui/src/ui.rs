@@ -203,7 +203,7 @@ fn build_audio_controls(
     section.set_css_classes(&["control-surface"]);
     section.append(&section_label(
         "MICROPHONE",
-        "AAC-ELD decoded into the AirPodsHiRes PipeWire source",
+        "PipeWire source: Microphone virtual - Abdulloh's AirPods Pro",
     ));
 
     let mic_active = Rc::new(Cell::new(false));

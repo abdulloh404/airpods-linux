@@ -1,0 +1,1 @@
+savedcmd_/home/abdulloh/github.com/airpods-linux/kernel/airpods-power/Module.symvers :=  scripts/mod/modpost -M -m -a      -o /home/abdulloh/github.com/airpods-linux/kernel/airpods-power/Module.symvers -T /home/abdulloh/github.com/airpods-linux/kernel/airpods-power/modules.order -i Module.symvers -e 

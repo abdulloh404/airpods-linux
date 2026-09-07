@@ -31,7 +31,7 @@ fn main() {
         .warnings(true)
         .file(manifest_dir.join("native/audio_engine.cpp"))
         .include(manifest_dir.join("native"))
-        .include(fdk_source.join("libAACdec/include"));
+        .include(fdk_install.join("include/fdk-aac"));
     for include in &pipewire.include_paths {
         native.include(include);
     }

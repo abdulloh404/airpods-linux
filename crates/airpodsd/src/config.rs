@@ -62,11 +62,11 @@ impl ConfigStore {
         fs::create_dir_all(parent)?;
 
         let temporary = temporary_path(&self.path);
+        let encoded = toml::to_string_pretty(config)?;
         let mut file = OpenOptions::new()
             .write(true)
             .create_new(true)
             .open(&temporary)?;
-        let encoded = toml::to_string_pretty(config)?;
         if let Err(error) = (|| -> io::Result<()> {
             file.write_all(encoded.as_bytes())?;
             file.sync_all()?;

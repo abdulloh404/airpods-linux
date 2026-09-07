@@ -1,0 +1,1 @@
+savedcmd_/home/abdulloh/github.com/airpods-linux/kernel/airpods-power/airpods_power.mod := printf '%s\n'   airpods_power.o | awk '!x[$$0]++ { print("/home/abdulloh/github.com/airpods-linux/kernel/airpods-power/"$$0) }' > /home/abdulloh/github.com/airpods-linux/kernel/airpods-power/airpods_power.mod

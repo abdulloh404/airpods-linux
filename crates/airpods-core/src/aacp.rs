@@ -79,10 +79,12 @@ impl AacpSession {
         if self.started {
             return Ok(());
         }
-        self.send(&AACP_START_AUDIO)
-            .await
-            .context("AACP microphone START failed")?;
+        // ตั้งค่าก่อน `await` เพื่อให้ caller ที่ cancel งานยังส่ง STOP แบบ best-effort ได้
         self.started = true;
+        if let Err(error) = self.send(&AACP_START_AUDIO).await {
+            self.started = false;
+            return Err(error).context("AACP microphone START failed");
+        }
         info!("[aacp] hi-res microphone START sent");
         Ok(())
     }

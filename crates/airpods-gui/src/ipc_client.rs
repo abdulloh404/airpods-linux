@@ -88,12 +88,6 @@ async fn run(mut commands: tokio_mpsc::UnboundedReceiver<Command>, events: mpsc:
             }
         };
 
-        if let Err(error) = send_snapshot(&proxy, &events).await {
-            send_error(&events, "airpodsd is not available", &error);
-            tokio::time::sleep(Duration::from_secs(2)).await;
-            continue;
-        }
-
         let mut status_signals = match proxy.receive_status_changed().await {
             Ok(signals) => signals,
             Err(error) => {
@@ -118,6 +112,12 @@ async fn run(mut commands: tokio_mpsc::UnboundedReceiver<Command>, events: mpsc:
                 continue;
             }
         };
+
+        if let Err(error) = send_snapshot(&proxy, &events).await {
+            send_error(&events, "airpodsd is not available", &error);
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            continue;
+        }
 
         loop {
             tokio::select! {
