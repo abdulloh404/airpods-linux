@@ -1,0 +1,14 @@
+[package]
+name = "airpods-gui"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license = "MIT"
+
+[dependencies]
+airpods-ipc = { path = "../airpods-ipc" }
+futures-util.workspace = true
+gtk4.workspace = true
+tokio.workspace = true
+zbus.workspace = true

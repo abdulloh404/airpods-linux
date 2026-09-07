@@ -1,0 +1,236 @@
+window {
+  background: #EEF4F7;
+  color: #34546C;
+  font-family: "Ubuntu Sans", Cantarell, sans-serif;
+  font-size: 15px;
+}
+
+.app-shell {
+  background: #EEF4F7;
+}
+
+.eyebrow,
+.section-label,
+.battery-name {
+  color: #327A89;
+  font-size: 11px;
+  font-weight: 800;
+  letter-spacing: 1.4px;
+}
+
+.title {
+  color: #203D52;
+  font-size: 32px;
+  font-weight: 800;
+}
+
+.section-description,
+.control-description,
+.empty-state {
+  color: #607B8E;
+}
+
+.daemon-badge {
+  border-radius: 999px;
+  padding: 7px 11px;
+  font-family: "Ubuntu Mono", monospace;
+  font-size: 11px;
+  font-weight: 700;
+}
+
+.state-ok {
+  background: #D6ECE9;
+  color: #23696D;
+}
+
+.state-warn {
+  background: #FAE8CF;
+  color: #8A5522;
+}
+
+.state-error {
+  background: #F5DAD5;
+  color: #8B4138;
+}
+
+.quiet-action,
+.device-row combobox button {
+  background: #F8FBFC;
+  color: #34546C;
+  border: 1px solid #C4D8E1;
+  border-radius: 12px;
+  box-shadow: none;
+  padding: 9px 13px;
+}
+
+.quiet-action:hover,
+.device-row combobox button:hover {
+  background: #FFFFFF;
+  border-color: #327A89;
+}
+
+.device-row {
+  background: #D7E5EC;
+  border-radius: 16px;
+  padding: 12px;
+}
+
+.connection-state,
+.data {
+  font-family: "Ubuntu Mono", monospace;
+}
+
+.connection-state {
+  color: #327A89;
+  font-size: 12px;
+  font-weight: 700;
+  padding: 0 8px;
+}
+
+.empty-state {
+  border-left: 3px solid #F0A65A;
+  padding: 7px 12px;
+}
+
+.empty-title {
+  color: #34546C;
+  font-weight: 700;
+}
+
+.control-surface {
+  background: #FFFFFF;
+  border: 1px solid #D7E5EC;
+  border-radius: 20px;
+  padding: 22px;
+  box-shadow: 0 8px 22px rgba(52, 84, 108, 0.08);
+}
+
+.control-title {
+  color: #34546C;
+  font-weight: 700;
+}
+
+.control-description {
+  font-size: 13px;
+}
+
+.control-value {
+  color: #327A89;
+  font-weight: 700;
+}
+
+.primary-action {
+  background: #327A89;
+  color: #FFFFFF;
+  border: 0;
+  border-radius: 13px;
+  box-shadow: none;
+  padding: 12px 18px;
+  font-weight: 700;
+}
+
+.primary-action:hover {
+  background: #286A78;
+}
+
+.primary-action:disabled {
+  background: #B9CAD2;
+  color: #EEF4F7;
+}
+
+scale trough {
+  min-height: 7px;
+  border-radius: 999px;
+  background: #D7E5EC;
+}
+
+scale highlight {
+  min-height: 7px;
+  border-radius: 999px;
+  background: #327A89;
+}
+
+scale slider {
+  min-width: 17px;
+  min-height: 17px;
+  border-radius: 999px;
+  background: #FFFFFF;
+  border: 3px solid #327A89;
+  box-shadow: none;
+}
+
+.battery-pair {
+  padding: 2px 16px 8px;
+}
+
+.power-bridge {
+  color: #607B8E;
+  font-size: 12px;
+}
+
+.earbud-unit {
+  min-width: 150px;
+}
+
+.battery-capsule {
+  min-width: 124px;
+  min-height: 128px;
+  background: #FFFFFF;
+  color: #34546C;
+  border: 2px solid #D7E5EC;
+  border-radius: 54px 54px 38px 38px;
+  padding: 17px 18px 14px;
+  box-shadow: 0 7px 18px rgba(52, 84, 108, 0.09);
+}
+
+.battery-side {
+  color: #327A89;
+  font-size: 12px;
+  font-weight: 800;
+}
+
+.battery-value {
+  color: #203D52;
+  font-size: 27px;
+  font-weight: 800;
+}
+
+.battery-capsule progressbar trough {
+  min-height: 6px;
+  min-width: 86px;
+  background: #D7E5EC;
+  border-radius: 999px;
+}
+
+.battery-capsule progressbar progress {
+  min-height: 6px;
+  background: #327A89;
+  border-radius: 999px;
+}
+
+.earbud-stem {
+  min-width: 34px;
+  min-height: 30px;
+  background: #FFFFFF;
+  border-left: 2px solid #D7E5EC;
+  border-right: 2px solid #D7E5EC;
+  border-bottom: 2px solid #D7E5EC;
+  border-radius: 0 0 15px 15px;
+}
+
+.error-banner {
+  background: #FFF3E4;
+  color: #7C4B22;
+  border-left: 4px solid #F0A65A;
+  border-radius: 8px;
+  padding: 10px 13px;
+}
+
+button:focus,
+combobox:focus,
+scale:focus {
+  outline-color: #F0A65A;
+  outline-style: solid;
+  outline-width: 3px;
+  outline-offset: 2px;
+}

@@ -1,0 +1,15 @@
+/target/
+
+# C/C++ และ kernel build artifacts
+*.a
+*.d
+*.ko
+*.mod
+*.mod.c
+*.o
+*.order
+*.so
+*.symvers
+.cache/
+compile_commands.json
+

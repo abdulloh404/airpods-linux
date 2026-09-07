@@ -1,0 +1,1 @@
+KERNEL=="airpods_power", SUBSYSTEM=="misc", MODE="0660", TAG+="uaccess"

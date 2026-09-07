@@ -1,0 +1,12 @@
+[package]
+name = "airpodsctl"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[dependencies]
+airpods-ipc = { path = "../airpods-ipc" }
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+zbus = { version = "5", default-features = false, features = ["tokio"] }

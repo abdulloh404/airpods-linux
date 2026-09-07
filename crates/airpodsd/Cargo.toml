@@ -1,0 +1,18 @@
+[package]
+name = "airpodsd"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[dependencies]
+airpods-audio = { path = "../airpods-audio" }
+airpods-core = { path = "../airpods-core" }
+airpods-ipc = { path = "../airpods-ipc" }
+anyhow = "1"
+bluer = "0.17"
+dirs = "6"
+serde = { version = "1", features = ["derive"] }
+tokio = { version = "1", features = ["fs", "io-util", "macros", "rt-multi-thread", "signal", "sync", "time"] }
+toml = "0.9"
+zbus = { version = "5", default-features = false, features = ["tokio"] }
+zvariant = "5"

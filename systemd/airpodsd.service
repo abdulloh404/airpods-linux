@@ -1,0 +1,15 @@
+[Unit]
+Description=AirPods Linux daemon
+Documentation=https://github.com/abdulloh404/airpods-linux
+After=pipewire.service wireplumber.service
+Wants=pipewire.service wireplumber.service
+
+[Service]
+Type=dbus
+BusName=io.github.abdulloh404.AirPods
+ExecStart=%h/.local/bin/airpodsd
+Restart=on-failure
+RestartSec=2s
+
+[Install]
+WantedBy=default.target
