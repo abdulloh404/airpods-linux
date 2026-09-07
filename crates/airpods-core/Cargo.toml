@@ -2,8 +2,9 @@
 name = "airpods-core"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 authors.workspace = true
-license = "MIT"
+publish.workspace = true
 
 [dependencies]
 anyhow = "1.0"

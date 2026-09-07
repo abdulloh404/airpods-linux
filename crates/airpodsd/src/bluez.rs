@@ -44,11 +44,12 @@ pub async fn list_airpods(selected: &str) -> zbus::Result<Vec<DeviceInfo>> {
 fn string_property(properties: &HashMap<String, OwnedValue>, name: &str) -> Option<String> {
     properties
         .get(name)
-        .and_then(|value| String::try_from(value.clone()).ok())
+        .and_then(|value| <&str>::try_from(value).ok())
+        .map(str::to_owned)
 }
 
 fn bool_property(properties: &HashMap<String, OwnedValue>, name: &str) -> Option<bool> {
     properties
         .get(name)
-        .and_then(|value| bool::try_from(value.clone()).ok())
+        .and_then(|value| bool::try_from(value).ok())
 }

@@ -50,16 +50,9 @@ unsafe extern "C" {
         error_size: usize,
     ) -> *mut NativeEngine;
     fn airpods_audio_destroy(engine: *mut NativeEngine);
-    fn airpods_audio_start(
-        engine: *mut NativeEngine,
-        error: *mut c_char,
-        error_size: usize,
-    ) -> i32;
-    fn airpods_audio_stop(
-        engine: *mut NativeEngine,
-        error: *mut c_char,
-        error_size: usize,
-    ) -> i32;
+    fn airpods_audio_start(engine: *mut NativeEngine, error: *mut c_char, error_size: usize)
+    -> i32;
+    fn airpods_audio_stop(engine: *mut NativeEngine, error: *mut c_char, error_size: usize) -> i32;
     fn airpods_audio_push(
         engine: *mut NativeEngine,
         data: *const u8,
@@ -165,13 +158,8 @@ impl AudioEngine {
         };
         let mut error = error_buffer();
         // C++ constructor copy string ทั้งสองค่าก่อน `CString` ออกจาก scope
-        let native = unsafe {
-            airpods_audio_create(
-                &native_config,
-                error.as_mut_ptr(),
-                ERROR_BUFFER_SIZE,
-            )
-        };
+        let native =
+            unsafe { airpods_audio_create(&native_config, error.as_mut_ptr(), ERROR_BUFFER_SIZE) };
         let native = NonNull::new(native).ok_or_else(|| native_error(&error))?;
         Ok(Self { native })
     }

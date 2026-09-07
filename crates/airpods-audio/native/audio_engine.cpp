@@ -347,13 +347,7 @@ class Engine final {
             return;
         }
 
-        uint32_t bytes = data.maxsize - (data.maxsize % sizeof(int16_t));
-        if (buffer->requested > 0) {
-            const uint64_t requested_bytes =
-                static_cast<uint64_t>(buffer->requested) * sizeof(int16_t);
-            bytes = static_cast<uint32_t>(
-                std::min<uint64_t>(bytes, requested_bytes));
-        }
+        const uint32_t bytes = data.maxsize - (data.maxsize % sizeof(int16_t));
         auto *output = static_cast<int16_t *>(data.data);
         const size_t requested_samples = bytes / sizeof(int16_t);
         const size_t copied = queue_.pop(output, requested_samples);
@@ -410,8 +404,8 @@ class Engine final {
             }
 
             std::array<uint8_t, 1'024> pod_buffer{};
-            spa_pod_builder builder =
-                SPA_POD_BUILDER_INIT(pod_buffer.data(), pod_buffer.size());
+            spa_pod_builder builder{};
+            spa_pod_builder_init(&builder, pod_buffer.data(), pod_buffer.size());
             spa_audio_info_raw format{};
             format.format = SPA_AUDIO_FORMAT_S16_LE;
             format.rate = kSampleRate;
@@ -419,8 +413,7 @@ class Engine final {
             format.position[0] = SPA_AUDIO_CHANNEL_MONO;
             const spa_pod *params[] = {
                 spa_format_audio_raw_build(&builder, SPA_PARAM_EnumFormat, &format)};
-            const pw_stream_flags flags = static_cast<pw_stream_flags>(
-                PW_STREAM_FLAG_MAP_BUFFERS | PW_STREAM_FLAG_RT_PROCESS);
+            const pw_stream_flags flags = PW_STREAM_FLAG_MAP_BUFFERS;
             const int status = pw_stream_connect(stream, PW_DIRECTION_OUTPUT, PW_ID_ANY,
                                                  flags, params, 1);
             if (status < 0) {

@@ -92,7 +92,7 @@ async fn emit_events(
                         OBJECT_PATH,
                         MANAGER_INTERFACE,
                         "StatusChanged",
-                        &status,
+                        &(status,),
                     )
                     .await
             }
@@ -103,7 +103,7 @@ async fn emit_events(
                         OBJECT_PATH,
                         MANAGER_INTERFACE,
                         "BatteryChanged",
-                        &battery,
+                        &(battery,),
                     )
                     .await
             }
@@ -114,7 +114,7 @@ async fn emit_events(
                         OBJECT_PATH,
                         MANAGER_INTERFACE,
                         "DevicesChanged",
-                        &devices,
+                        &(devices,),
                     )
                     .await
             }

@@ -10,6 +10,8 @@ use crate::bluez;
 use crate::power::{PowerBridge, UpdateOutcome};
 use crate::service::{Event, SharedState};
 
+const BATTERY_FAILURES_BEFORE_INVALIDATION: u8 = 2;
+
 pub async fn inventory_loop(
     state: SharedState,
     events: mpsc::UnboundedSender<Event>,
@@ -49,6 +51,7 @@ pub async fn battery_loop(
     bridge: PowerBridge,
     mut shutdown: watch::Receiver<bool>,
 ) {
+    let mut consecutive_failures = 0_u8;
     loop {
         let scan = tokio::select! {
             result = scan_airpods_battery() => Some(result),
@@ -64,27 +67,28 @@ pub async fn battery_loop(
             break;
         };
 
-        if let Ok(battery) = scan {
-            let battery = BatteryStatus {
-                left_percent: battery.left.percent.map(i16::from).unwrap_or(-1),
-                left_charging: battery.left.charging,
-                right_percent: battery.right.percent.map(i16::from).unwrap_or(-1),
-                right_charging: battery.right.charging,
-            };
-            let bridge_available = matches!(bridge.update(battery).await, Ok(UpdateOutcome::Written));
-            let (battery_changed, status_changed, status) = {
-                let mut state = state.write().await;
-                let battery_changed = state.battery != battery;
-                let status_changed = state.status.power_bridge_available != bridge_available;
-                state.battery = battery;
-                state.status.power_bridge_available = bridge_available;
-                (battery_changed, status_changed, state.status.clone())
-            };
-            if battery_changed {
-                let _ = events.send(Event::Battery(battery));
+        match scan {
+            Ok(battery) => {
+                consecutive_failures = 0;
+                let battery = BatteryStatus {
+                    left_percent: battery.left.percent.map(i16::from).unwrap_or(-1),
+                    left_charging: battery.left.charging,
+                    right_percent: battery.right.percent.map(i16::from).unwrap_or(-1),
+                    right_charging: battery.right.charging,
+                };
+                publish_battery(&state, &events, &bridge, battery).await;
             }
-            if status_changed {
-                let _ = events.send(Event::Status(status));
+            Err(_) => {
+                consecutive_failures = consecutive_failures.saturating_add(1);
+                if consecutive_failures >= BATTERY_FAILURES_BEFORE_INVALIDATION {
+                    publish_battery(
+                        &state,
+                        &events,
+                        &bridge,
+                        BatteryStatus::unavailable(),
+                    )
+                    .await;
+                }
             }
         }
 
@@ -96,5 +100,30 @@ pub async fn battery_loop(
                 }
             }
         }
+    }
+
+    let _ = bridge.invalidate().await;
+}
+
+async fn publish_battery(
+    state: &SharedState,
+    events: &mpsc::UnboundedSender<Event>,
+    bridge: &PowerBridge,
+    battery: BatteryStatus,
+) {
+    let bridge_available = matches!(bridge.update(battery).await, Ok(UpdateOutcome::Written));
+    let (battery_changed, status_changed, status) = {
+        let mut state = state.write().await;
+        let battery_changed = state.battery != battery;
+        let status_changed = state.status.power_bridge_available != bridge_available;
+        state.battery = battery;
+        state.status.power_bridge_available = bridge_available;
+        (battery_changed, status_changed, state.status.clone())
+    };
+    if battery_changed {
+        let _ = events.send(Event::Battery(battery));
+    }
+    if status_changed {
+        let _ = events.send(Event::Status(status));
     }
 }

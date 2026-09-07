@@ -1,7 +1,7 @@
 //! ส่งค่าแบตเตอรี่ไปยัง kernel bridge เมื่อ `/dev/airpods_power` พร้อมใช้งาน
 
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use airpods_ipc::BatteryStatus;
 use tokio::io::AsyncWriteExt;
@@ -25,6 +25,11 @@ impl Default for PowerBridge {
 }
 
 impl PowerBridge {
+    /// ล้างค่าแบตเตอรี่เมื่อ daemon ไม่มีข้อมูลสดหรือกำลังปิดตัว
+    pub async fn invalidate(&self) -> io::Result<UpdateOutcome> {
+        self.update(BatteryStatus::unavailable()).await
+    }
+
     pub async fn update(&self, battery: BatteryStatus) -> io::Result<UpdateOutcome> {
         let mut device = match tokio::fs::OpenOptions::new().write(true).open(&self.path).await {
             Ok(device) => device,
@@ -44,11 +49,6 @@ impl PowerBridge {
         ];
         device.write_all(&payload).await?;
         Ok(UpdateOutcome::Written)
-    }
-
-    #[allow(dead_code)]
-    pub fn path(&self) -> &Path {
-        &self.path
     }
 }
 

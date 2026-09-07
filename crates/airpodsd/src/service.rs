@@ -57,12 +57,7 @@ impl RuntimeState {
                 last_error: config_error,
             },
             devices: Vec::new(),
-            battery: BatteryStatus {
-                left_percent: -1,
-                left_charging: false,
-                right_percent: -1,
-                right_charging: false,
-            },
+            battery: BatteryStatus::unavailable(),
         }
     }
 }
@@ -128,7 +123,7 @@ impl ManagerService {
             next
         };
 
-        {
+        let devices = {
             let mut state = self.state.write().await;
             state.status.selected_device = next.selected_device.clone();
             for device in &mut state.devices {
@@ -136,25 +131,22 @@ impl ManagerService {
                     .address
                     .eq_ignore_ascii_case(&next.selected_device);
             }
-        }
-        let mut desired = self.desired.borrow().clone();
-        desired.address = next.selected_device;
-        self.desired.send_replace(desired);
+            state.devices.clone()
+        };
+        self.desired
+            .send_modify(|desired| desired.address = next.selected_device.clone());
+        let _ = self.events.send(Event::Devices(devices));
         self.publish_status().await;
         Ok(())
     }
 
     async fn start_mic(&self) -> zbus::fdo::Result<()> {
-        let mut desired = self.desired.borrow().clone();
-        desired.enabled = true;
-        self.desired.send_replace(desired);
+        self.desired.send_modify(|desired| desired.enabled = true);
         Ok(())
     }
 
     async fn stop_mic(&self) -> zbus::fdo::Result<()> {
-        let mut desired = self.desired.borrow().clone();
-        desired.enabled = false;
-        self.desired.send_replace(desired);
+        self.desired.send_modify(|desired| desired.enabled = false);
         Ok(())
     }
 
@@ -174,9 +166,8 @@ impl ManagerService {
             *config = next;
         }
         self.state.write().await.status.gain_db = gain_db;
-        let mut desired = self.desired.borrow().clone();
-        desired.gain_db = gain_db;
-        self.desired.send_replace(desired);
+        self.desired
+            .send_modify(|desired| desired.gain_db = gain_db);
         self.publish_status().await;
         Ok(())
     }
@@ -197,9 +188,8 @@ impl ManagerService {
             *config = next;
         }
         self.state.write().await.status.limiter_db = limiter_db;
-        let mut desired = self.desired.borrow().clone();
-        desired.limiter_db = limiter_db;
-        self.desired.send_replace(desired);
+        self.desired
+            .send_modify(|desired| desired.limiter_db = limiter_db);
         self.publish_status().await;
         Ok(())
     }

@@ -52,6 +52,18 @@ pub struct BatteryStatus {
     pub right_charging: bool,
 }
 
+impl BatteryStatus {
+    /// สร้างสถานะที่ระบุว่ายังไม่มีค่าแบตเตอรี่ที่เชื่อถือได้
+    pub const fn unavailable() -> Self {
+        Self {
+            left_percent: -1,
+            left_charging: false,
+            right_percent: -1,
+            right_charging: false,
+        }
+    }
+}
+
 /// D-Bus proxy สำหรับเรียก `airpodsd` โดยไม่เข้าถึง config หรือ service manager โดยตรง
 #[zbus::proxy(
     interface = "io.github.abdulloh404.AirPods.Manager1",

@@ -2,8 +2,9 @@
 name = "airpods-audio"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 authors.workspace = true
-license = "MIT"
+publish.workspace = true
 build = "build.rs"
 
 [dependencies]

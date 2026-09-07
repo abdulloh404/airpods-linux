@@ -3,14 +3,17 @@
 
 #include <linux/fs.h>
 #include <linux/err.h>
+#include <linux/jiffies.h>
 #include <linux/miscdevice.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
 #include <linux/power_supply.h>
 #include <linux/slab.h>
 #include <linux/uaccess.h>
+#include <linux/workqueue.h>
 
 #define AIRPODS_POWER_PROTOCOL_VERSION 1
+#define AIRPODS_POWER_STALE_TIMEOUT_MS 90000
 
 struct airpods_power_update {
 	__u8 version;
@@ -35,6 +38,7 @@ struct airpods_power_cell {
 
 struct airpods_power_bridge {
 	struct mutex lock;
+	struct delayed_work stale_work;
 	struct airpods_power_cell left;
 	struct airpods_power_cell right;
 };
@@ -112,6 +116,24 @@ static bool airpods_power_valid_bool(u8 value)
 	return value == 0 || value == 1;
 }
 
+static void airpods_power_mark_stale(struct work_struct *work)
+{
+	struct airpods_power_bridge *target = container_of(
+		to_delayed_work(work), struct airpods_power_bridge, stale_work);
+
+	mutex_lock(&target->lock);
+	target->left.present = false;
+	target->left.capacity = 0;
+	target->left.charging = false;
+	target->right.present = false;
+	target->right.capacity = 0;
+	target->right.charging = false;
+	mutex_unlock(&target->lock);
+
+	power_supply_changed(target->left.supply);
+	power_supply_changed(target->right.supply);
+}
+
 static ssize_t airpods_power_write(struct file *file,
 				   const char __user *buffer, size_t length,
 				   loff_t *offset)
@@ -133,6 +155,7 @@ static ssize_t airpods_power_write(struct file *file,
 	    (update.right_present && update.right_capacity > 100))
 		return -ERANGE;
 
+	cancel_delayed_work_sync(&bridge->stale_work);
 	mutex_lock(&bridge->lock);
 	bridge->left.present = update.left_present;
 	bridge->left.capacity = update.left_capacity;
@@ -141,6 +164,8 @@ static ssize_t airpods_power_write(struct file *file,
 	bridge->right.capacity = update.right_capacity;
 	bridge->right.charging = update.right_charging;
 	mutex_unlock(&bridge->lock);
+	schedule_delayed_work(&bridge->stale_work,
+		msecs_to_jiffies(AIRPODS_POWER_STALE_TIMEOUT_MS));
 
 	power_supply_changed(bridge->left.supply);
 	power_supply_changed(bridge->right.supply);
@@ -180,6 +205,7 @@ static int __init airpods_power_init(void)
 		return -ENOMEM;
 
 	mutex_init(&bridge->lock);
+	INIT_DELAYED_WORK(&bridge->stale_work, airpods_power_mark_stale);
 	bridge->left.bridge = bridge;
 	bridge->left.model = "AirPods Left";
 	bridge->right.bridge = bridge;
@@ -210,6 +236,7 @@ free_bridge:
 
 static void __exit airpods_power_exit(void)
 {
+	cancel_delayed_work_sync(&bridge->stale_work);
 	misc_deregister(&airpods_power_miscdev);
 	power_supply_unregister(bridge->right.supply);
 	power_supply_unregister(bridge->left.supply);

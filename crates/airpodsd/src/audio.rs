@@ -111,12 +111,37 @@ async fn stream_once(
         Ok(address) => address,
         Err(error) => return AttemptExit::Failed(error.to_string()),
     };
-    let mut session = match AacpSession::connect(address).await {
+    let connection = tokio::select! {
+        result = AacpSession::connect(address) => result,
+        changed = desired.changed() => {
+            return if changed.is_err() {
+                AttemptExit::Shutdown
+            } else {
+                AttemptExit::Reconfigure
+            };
+        }
+        _ = shutdown.changed() => return AttemptExit::Shutdown,
+    };
+    let mut session = match connection {
         Ok(session) => session,
         Err(error) => return AttemptExit::Failed(error.to_string()),
     };
-    if let Err(error) = session.initialize().await {
+    let initialization = tokio::select! {
+        result = session.initialize() => result,
+        changed = desired.changed() => {
+            return if changed.is_err() {
+                AttemptExit::Shutdown
+            } else {
+                AttemptExit::Reconfigure
+            };
+        }
+        _ = shutdown.changed() => return AttemptExit::Shutdown,
+    };
+    if let Err(error) = initialization {
         return AttemptExit::Failed(error.to_string());
+    }
+    if let Some(exit) = stale_startup(desired, shutdown, &target) {
+        return exit;
     }
 
     let mut audio_config = AudioConfig::default();
@@ -126,12 +151,24 @@ async fn stream_once(
         Ok(engine) => engine,
         Err(error) => return AttemptExit::Failed(error.to_string()),
     };
+    if let Some(exit) = stale_startup(desired, shutdown, &target) {
+        return exit;
+    }
     if let Err(error) = engine.start() {
         return AttemptExit::Failed(error.to_string());
+    }
+    if let Some(exit) = stale_startup(desired, shutdown, &target) {
+        let _ = engine.stop();
+        return exit;
     }
     if let Err(error) = session.start_audio().await {
         let _ = engine.stop();
         return AttemptExit::Failed(error.to_string());
+    }
+    if let Some(exit) = stale_startup(desired, shutdown, &target) {
+        let _ = session.stop_audio().await;
+        let _ = engine.stop();
+        return exit;
     }
 
     set_audio_status(state, events, "streaming", true, 0, None).await;
@@ -185,6 +222,20 @@ async fn stream_once(
     let _ = engine.stop();
     set_audio_status(state, events, "stopping", false, 0, None).await;
     outcome
+}
+
+fn stale_startup(
+    desired: &mut watch::Receiver<DesiredAudio>,
+    shutdown: &watch::Receiver<bool>,
+    target: &DesiredAudio,
+) -> Option<AttemptExit> {
+    if *shutdown.borrow() {
+        return Some(AttemptExit::Shutdown);
+    }
+    if &*desired.borrow_and_update() != target {
+        return Some(AttemptExit::Reconfigure);
+    }
+    None
 }
 
 async fn wait_for_change(

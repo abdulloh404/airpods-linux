@@ -25,7 +25,7 @@ make build
 ```
 
 The project does not currently build a Debian package. The user service unit
-is kept in `systemd/user/airpodsd.service` for later installation work.
+is kept in `systemd/airpodsd.service` for later installation work.
 
 ## Runtime ownership
 
