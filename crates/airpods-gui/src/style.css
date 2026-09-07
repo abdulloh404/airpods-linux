@@ -1,236 +1,196 @@
-window {
-  background: #EEF4F7;
-  color: #34546C;
+window,
+.app-shell {
+  background: #202020;
+  color: #F4F4F4;
   font-family: "Ubuntu Sans", Cantarell, sans-serif;
   font-size: 15px;
 }
 
-.app-shell {
-  background: #EEF4F7;
-}
-
-.eyebrow,
-.section-label,
-.battery-name {
-  color: #327A89;
-  font-size: 11px;
-  font-weight: 800;
-  letter-spacing: 1.4px;
-}
-
-.title {
-  color: #203D52;
-  font-size: 32px;
-  font-weight: 800;
-}
-
-.section-description,
-.control-description,
-.empty-state {
-  color: #607B8E;
-}
-
-.daemon-badge {
-  border-radius: 999px;
-  padding: 7px 11px;
-  font-family: "Ubuntu Mono", monospace;
-  font-size: 11px;
-  font-weight: 700;
-}
-
-.state-ok {
-  background: #D6ECE9;
-  color: #23696D;
-}
-
-.state-warn {
-  background: #FAE8CF;
-  color: #8A5522;
-}
-
-.state-error {
-  background: #F5DAD5;
-  color: #8B4138;
-}
-
-.quiet-action,
-.device-row combobox button {
-  background: #F8FBFC;
-  color: #34546C;
-  border: 1px solid #C4D8E1;
-  border-radius: 12px;
+headerbar {
+  min-height: 46px;
+  background: #2B2B2B;
+  color: #F4F4F4;
+  border-bottom: 1px solid #424242;
   box-shadow: none;
-  padding: 9px 13px;
 }
 
-.quiet-action:hover,
-.device-row combobox button:hover {
-  background: #FFFFFF;
-  border-color: #327A89;
-}
-
-.device-row {
-  background: #D7E5EC;
-  border-radius: 16px;
-  padding: 12px;
-}
-
-.connection-state,
-.data {
-  font-family: "Ubuntu Mono", monospace;
-}
-
-.connection-state {
-  color: #327A89;
-  font-size: 12px;
+.window-title {
+  color: #F7F7F7;
   font-weight: 700;
-  padding: 0 8px;
 }
 
+.header-action {
+  background: #3B3B3B;
+  color: #F4F4F4;
+  border: 1px solid #4A4A4A;
+  border-radius: 9px;
+  box-shadow: none;
+  padding: 6px 11px;
+}
+
+.header-action:hover {
+  background: #484848;
+}
+
+.section-title {
+  color: #F7F7F7;
+  font-size: 15px;
+  font-weight: 700;
+}
+
+.settings-card {
+  background: #303030;
+  border: 1px solid #3F3F3F;
+  border-radius: 14px;
+  box-shadow: 0 7px 20px rgba(0, 0, 0, 0.16);
+}
+
+.settings-row {
+  min-height: 48px;
+  padding: 11px 14px;
+}
+
+.row-title {
+  color: #F3F3F3;
+  font-weight: 500;
+}
+
+.row-description,
 .empty-state {
-  border-left: 3px solid #F0A65A;
-  padding: 7px 12px;
-}
-
-.empty-title {
-  color: #34546C;
-  font-weight: 700;
-}
-
-.control-surface {
-  background: #FFFFFF;
-  border: 1px solid #D7E5EC;
-  border-radius: 20px;
-  padding: 22px;
-  box-shadow: 0 8px 22px rgba(52, 84, 108, 0.08);
-}
-
-.control-title {
-  color: #34546C;
-  font-weight: 700;
-}
-
-.control-description {
+  color: #AAAAAA;
   font-size: 13px;
 }
 
-.control-value {
-  color: #327A89;
-  font-weight: 700;
+.settings-separator {
+  min-height: 1px;
+  margin-left: 14px;
+  margin-right: 14px;
+  background: #484848;
 }
 
-.primary-action {
-  background: #327A89;
-  color: #FFFFFF;
-  border: 0;
-  border-radius: 13px;
-  box-shadow: none;
-  padding: 12px 18px;
-  font-weight: 700;
-}
-
-.primary-action:hover {
-  background: #286A78;
-}
-
-.primary-action:disabled {
-  background: #B9CAD2;
-  color: #EEF4F7;
-}
-
-scale trough {
-  min-height: 7px;
-  border-radius: 999px;
-  background: #D7E5EC;
-}
-
-scale highlight {
-  min-height: 7px;
-  border-radius: 999px;
-  background: #327A89;
-}
-
-scale slider {
-  min-width: 17px;
-  min-height: 17px;
-  border-radius: 999px;
-  background: #FFFFFF;
-  border: 3px solid #327A89;
-  box-shadow: none;
-}
-
-.battery-pair {
-  padding: 2px 16px 8px;
-}
-
-.power-bridge {
-  color: #607B8E;
-  font-size: 12px;
-}
-
-.earbud-unit {
-  min-width: 150px;
-}
-
-.battery-capsule {
-  min-width: 124px;
-  min-height: 128px;
-  background: #FFFFFF;
-  color: #34546C;
-  border: 2px solid #D7E5EC;
-  border-radius: 54px 54px 38px 38px;
-  padding: 17px 18px 14px;
-  box-shadow: 0 7px 18px rgba(52, 84, 108, 0.09);
-}
-
-.battery-side {
-  color: #327A89;
-  font-size: 12px;
-  font-weight: 800;
-}
-
+.status-value,
+.status-pill,
 .battery-value {
-  color: #203D52;
-  font-size: 27px;
-  font-weight: 800;
+  font-family: "Ubuntu Mono", monospace;
+  font-weight: 700;
 }
 
-.battery-capsule progressbar trough {
-  min-height: 6px;
-  min-width: 86px;
-  background: #D7E5EC;
+.status-value {
+  color: #D9D9D9;
+  font-size: 12px;
+}
+
+.status-pill {
   border-radius: 999px;
+  padding: 6px 9px;
+  font-size: 11px;
 }
 
-.battery-capsule progressbar progress {
-  min-height: 6px;
-  background: #327A89;
-  border-radius: 999px;
+.state-ok {
+  background: #244B3B;
+  color: #9FE2BD;
 }
 
-.earbud-stem {
-  min-width: 34px;
-  min-height: 30px;
-  background: #FFFFFF;
-  border-left: 2px solid #D7E5EC;
-  border-right: 2px solid #D7E5EC;
-  border-bottom: 2px solid #D7E5EC;
-  border-radius: 0 0 15px 15px;
+.state-warn {
+  background: #514425;
+  color: #F2D18C;
+}
+
+.state-error {
+  background: #532F35;
+  color: #F2A6B0;
+}
+
+.empty-state {
+  margin-top: 9px;
+  padding: 9px 12px;
+  border-left: 3px solid #7C62E8;
+}
+
+.empty-title {
+  color: #F3F3F3;
+  font-weight: 700;
 }
 
 .error-banner {
-  background: #FFF3E4;
-  color: #7C4B22;
-  border-left: 4px solid #F0A65A;
-  border-radius: 8px;
+  background: #4B3035;
+  color: #F5C4CB;
+  border-left: 4px solid #D66B7A;
+  border-radius: 9px;
   padding: 10px 13px;
+}
+
+.settings-card combobox button,
+.settings-card spinbutton {
+  background: #454545;
+  color: #F4F4F4;
+  border: 1px solid #565656;
+  border-radius: 9px;
+  box-shadow: none;
+}
+
+.settings-card combobox button {
+  padding: 8px 11px;
+}
+
+.settings-card spinbutton text {
+  color: #F4F4F4;
+}
+
+.settings-card spinbutton button {
+  background: #4B4B4B;
+  color: #F4F4F4;
+  border: 0;
+  box-shadow: none;
+}
+
+switch {
+  background: #5A5A5A;
+  border: 0;
+  box-shadow: none;
+}
+
+switch:checked {
+  background: #7C62E8;
+}
+
+switch slider {
+  background: #F7F7F7;
+  border: 0;
+  box-shadow: none;
+}
+
+.battery-control {
+  min-width: 142px;
+}
+
+.battery-value {
+  color: #F3F3F3;
+  font-size: 14px;
+}
+
+.battery-control progressbar trough {
+  min-height: 6px;
+  background: #505050;
+  border-radius: 999px;
+}
+
+.battery-control progressbar progress {
+  min-height: 6px;
+  background: #7C62E8;
+  border-radius: 999px;
+}
+
+.settings-card:disabled {
+  opacity: 0.52;
 }
 
 button:focus,
 combobox:focus,
-scale:focus {
-  outline-color: #F0A65A;
+spinbutton:focus,
+switch:focus {
+  outline-color: #9C89F2;
   outline-style: solid;
-  outline-width: 3px;
+  outline-width: 2px;
   outline-offset: 2px;
 }

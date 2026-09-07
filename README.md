@@ -36,3 +36,20 @@ the AirPods directly.
 The kernel battery bridge is optional for audio operation. Without it, exact
 Left and Right values remain available through `airpodsctl` and `airpods-gui`,
 but stock UPower cannot represent both values as separate devices.
+
+## Build
+
+
+```bash
+cd /home/abdulloh/github.com/airpods-linux
+
+make build
+sudo make install
+
+sudo modprobe airpods_power
+
+systemctl --user daemon-reload
+systemctl --user enable --now airpodsd.service
+
+airpods-gui
+```

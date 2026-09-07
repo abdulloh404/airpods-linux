@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=AirPods Linux
+Comment=Control AirPods microphone and battery
+Exec=/usr/local/bin/airpods-gui
+Icon=audio-headphones
+Terminal=false
+Categories=AudioVideo;Settings;
+StartupNotify=true

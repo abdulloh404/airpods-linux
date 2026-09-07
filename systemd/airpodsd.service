@@ -7,7 +7,7 @@ Wants=pipewire.service wireplumber.service
 [Service]
 Type=dbus
 BusName=io.github.abdulloh404.AirPods
-ExecStart=%h/.local/bin/airpodsd
+ExecStart=/usr/local/bin/airpodsd
 Restart=on-failure
 RestartSec=2s
 
