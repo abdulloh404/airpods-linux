@@ -5,8 +5,8 @@ use std::time::Duration;
 use airpods_audio::{AudioConfig, AudioEngine, PushOutcome};
 use airpods_core::aacp::AacpSession;
 use airpods_core::framing::{demux_audio_sdu, is_audio_sdu};
-use anyhow::Context;
-use tokio::sync::{mpsc, watch};
+use anyhow::{Context, bail};
+use tokio::sync::{mpsc, oneshot, watch, Mutex};
 
 use crate::service::{DesiredAudio, Event, SharedState};
 
@@ -14,7 +14,13 @@ const FIRST_AUDIO_TIMEOUT: Duration = Duration::from_secs(3);
 const AUDIO_STALL_TIMEOUT: Duration = Duration::from_secs(3);
 const DECODE_ERROR_LIMIT: u32 = 64;
 const QUEUE_FULL_LIMIT: u32 = 256;
-const CLEANUP_TIMEOUT: Duration = Duration::from_secs(1);
+const A2DP_RESET_DELAY: Duration = Duration::from_millis(800);
+const AACP_STOP_SETTLE_DELAY: Duration = Duration::from_millis(200);
+const PACTL_TIMEOUT: Duration = Duration::from_secs(2);
+const A2DP_RESTORE_ATTEMPTS: usize = 3;
+const A2DP_RESTORE_RETRY_DELAY: Duration = Duration::from_millis(100);
+
+static A2DP_PENDING_RESTORE: Mutex<Option<(String, String)>> = Mutex::const_new(None);
 
 enum AttemptExit {
     Reconfigure,
@@ -187,18 +193,31 @@ async fn stream_once(
     match start {
         StartAudioExit::Completed(Ok(())) => {}
         StartAudioExit::Completed(Err(error)) => {
-            stop_stream(&mut session, &mut engine).await;
+            stop_stream(&mut session, &mut engine, &target.address).await;
             return AttemptExit::Failed(error.to_string());
         }
         StartAudioExit::Cancelled(exit) => {
-            stop_stream(&mut session, &mut engine).await;
+            stop_stream(&mut session, &mut engine, &target.address).await;
             return exit;
         }
     }
     if let Some(exit) = stale_startup(desired, shutdown, &target) {
-        stop_stream(&mut session, &mut engine).await;
+        stop_stream(&mut session, &mut engine, &target.address).await;
         return exit;
     }
+
+    let reset_address = target.address.clone();
+    let (cancel_reset, reset_cancelled) = oneshot::channel();
+    let start_reset = tokio::spawn(async move {
+        tokio::select! {
+            _ = tokio::time::sleep(A2DP_RESET_DELAY) => {
+                if let Err(error) = reset_a2dp(&reset_address).await {
+                    eprintln!("failed to reset A2DP after microphone START: {error}");
+                }
+            }
+            _ = reset_cancelled => {}
+        }
+    });
 
     set_audio_status(state, events, "streaming", true, 0, None).await;
     let mut packet = vec![0_u8; 65_535];
@@ -284,14 +303,121 @@ async fn stream_once(
         }
     };
 
-    stop_stream(&mut session, &mut engine).await;
+    let _ = cancel_reset.send(());
+    let _ = start_reset.await;
+    stop_stream(&mut session, &mut engine, &target.address).await;
     set_audio_status(state, events, "stopping", false, 0, None).await;
     outcome
 }
 
-async fn stop_stream(session: &mut AacpSession, engine: &mut AudioEngine) {
-    let _ = tokio::time::timeout(CLEANUP_TIMEOUT, session.stop_audio()).await;
+async fn stop_stream(session: &mut AacpSession, engine: &mut AudioEngine, address: &str) {
+    let was_started = session.is_audio_started();
+    let stopped = match session.stop_audio().await {
+        Ok(()) => true,
+        Err(error) => {
+            eprintln!("failed to stop AACP microphone stream cleanly: {error}");
+            false
+        }
+    };
+    if was_started {
+        if stopped {
+            tokio::time::sleep(AACP_STOP_SETTLE_DELAY).await;
+        }
+        if let Err(error) = reset_a2dp(address).await {
+            eprintln!("failed to reset A2DP after microphone STOP: {error}");
+        }
+    }
     let _ = engine.stop();
+}
+
+async fn reset_a2dp(address: &str) -> anyhow::Result<()> {
+    let mut pending_restore = A2DP_PENDING_RESTORE.lock().await;
+    if let Some((card, profile)) = pending_restore.as_ref() {
+        restore_card_profile(card, profile)
+            .await
+            .context("failed to recover a pending A2DP profile restoration")?;
+        *pending_restore = None;
+    }
+
+    let card = format!("bluez_card.{}", address.replace(':', "_"));
+    let output = run_pactl(&["list", "cards"])
+        .await
+        .context("failed to inspect PipeWire cards with pactl")?;
+    if !output.status.success() {
+        bail!(
+            "pactl list cards failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+
+    let mut in_card = false;
+    let mut active_profile = None;
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        let line = line.trim();
+        if line.starts_with("Card #") {
+            in_card = false;
+        } else if let Some(name) = line.strip_prefix("Name: ") {
+            in_card = name == card;
+        } else if in_card {
+            if let Some(profile) = line.strip_prefix("Active Profile: ") {
+                active_profile = Some(profile.to_owned());
+                break;
+            }
+        }
+    }
+
+    let Some(profile) = active_profile.filter(|profile| profile.starts_with("a2dp-sink")) else {
+        return Ok(());
+    };
+    *pending_restore = Some((card.clone(), profile.clone()));
+    let off_result = set_card_profile(&card, "off").await;
+    let restore_result = restore_card_profile(&card, &profile).await;
+    if restore_result.is_ok() {
+        *pending_restore = None;
+    }
+    restore_result?;
+    off_result
+}
+
+async fn restore_card_profile(card: &str, profile: &str) -> anyhow::Result<()> {
+    let mut restore_error = None;
+    for attempt in 0..A2DP_RESTORE_ATTEMPTS {
+        match set_card_profile(card, profile).await {
+            Ok(()) => return Ok(()),
+            Err(error) => restore_error = Some(error),
+        }
+        if attempt + 1 < A2DP_RESTORE_ATTEMPTS {
+            tokio::time::sleep(A2DP_RESTORE_RETRY_DELAY).await;
+        }
+    }
+
+    Err(restore_error.expect("at least one A2DP restore attempt must run"))
+}
+
+async fn set_card_profile(card: &str, profile: &str) -> anyhow::Result<()> {
+    let output = run_pactl(&["set-card-profile", card, profile])
+        .await
+        .with_context(|| format!("failed to set {card} profile to {profile}"))?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        bail!(
+            "failed to set {card} profile to {profile}: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )
+    }
+}
+
+async fn run_pactl(args: &[&str]) -> anyhow::Result<std::process::Output> {
+    let mut command = tokio::process::Command::new("pactl");
+    command
+        .env("LC_ALL", "C")
+        .args(args)
+        .kill_on_drop(true);
+    tokio::time::timeout(PACTL_TIMEOUT, command.output())
+        .await
+        .context("pactl command timed out")?
+        .context("failed to run pactl")
 }
 
 fn stale_startup(

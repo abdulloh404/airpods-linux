@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 #[serde(default)]
 pub struct Config {
     pub selected_device: String,
+    pub mic_enabled: bool,
     pub gain_db: f64,
     pub limiter_db: f64,
 }
@@ -22,6 +23,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             selected_device: String::new(),
+            mic_enabled: false,
             gain_db: DEFAULT_GAIN_DB,
             limiter_db: DEFAULT_LIMITER_DB,
         }

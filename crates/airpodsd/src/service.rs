@@ -21,7 +21,7 @@ pub struct DesiredAudio {
 impl DesiredAudio {
     pub fn from_config(config: &Config) -> Self {
         Self {
-            enabled: false,
+            enabled: config.mic_enabled,
             address: config.selected_device.clone(),
             gain_db: config.gain_db,
             limiter_db: config.limiter_db,
@@ -141,13 +141,29 @@ impl ManagerService {
     }
 
     async fn start_mic(&self) -> zbus::fdo::Result<()> {
+        let persisted = {
+            let mut config = self.config.lock().await;
+            let mut next = config.clone();
+            next.mic_enabled = true;
+            let result = self.config_store.save(&next);
+            *config = next;
+            result
+        };
         self.desired.send_modify(|desired| desired.enabled = true);
-        Ok(())
+        persisted.map_err(|error| zbus::fdo::Error::Failed(error.to_string()))
     }
 
     async fn stop_mic(&self) -> zbus::fdo::Result<()> {
+        let persisted = {
+            let mut config = self.config.lock().await;
+            let mut next = config.clone();
+            next.mic_enabled = false;
+            let result = self.config_store.save(&next);
+            *config = next;
+            result
+        };
         self.desired.send_modify(|desired| desired.enabled = false);
-        Ok(())
+        persisted.map_err(|error| zbus::fdo::Error::Failed(error.to_string()))
     }
 
     async fn set_gain(&self, gain_db: f64) -> zbus::fdo::Result<()> {
