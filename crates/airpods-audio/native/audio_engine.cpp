@@ -2,11 +2,13 @@
 
 #include <aacdecoder_lib.h>
 #include <pipewire/pipewire.h>
+#include <spa/node/io.h>
 #include <spa/param/audio/format-utils.h>
 
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -25,13 +27,36 @@ namespace {
 
 constexpr uint32_t kSampleRate = 64'000;
 constexpr uint32_t kChannels = 1;
+constexpr size_t kAacFrameSamples = 480;
 constexpr size_t kPcmBufferSamples = 8'192;
+constexpr uint32_t kInitialJitterTargetMs = 60;
+constexpr uint32_t kMinimumJitterTargetMs = 40;
+constexpr uint32_t kMaximumJitterTargetMs = 80;
+constexpr uint32_t kHardJitterLimitMs = 150;
+constexpr uint64_t kJitterWindowMicroseconds = 2'000'000;
+constexpr uint64_t kJitterTargetStepMicroseconds = 20'000;
+constexpr double kRateControlPeriodSeconds = 1.0;
+constexpr double kMaximumRateCorrection = 0.005;
+constexpr char kNodeLatency[] = "640/64000";
 constexpr float kMinGainDb = 0.0F;
 constexpr float kMaxGainDb = 30.0F;
 constexpr float kMinLimiterDbfs = -12.0F;
 constexpr float kMaxLimiterDbfs = 0.0F;
 constexpr float kLimiterReleaseSeconds = 0.1F;
 constexpr std::array<UCHAR, 4> kEldAsc = {0xF8, 0xE6, 0x30, 0x00};
+constexpr std::array<int16_t, kAacFrameSamples> kConcealmentSilence{};
+
+constexpr size_t samples_for_milliseconds(uint32_t milliseconds) noexcept {
+    return static_cast<size_t>(kSampleRate) * milliseconds / 1'000;
+}
+
+void update_maximum(std::atomic<uint64_t> &value, uint64_t candidate) noexcept {
+    uint64_t current = value.load(std::memory_order_relaxed);
+    while (current < candidate &&
+           !value.compare_exchange_weak(current, candidate, std::memory_order_relaxed,
+                                        std::memory_order_relaxed)) {
+    }
+}
 
 void write_error(char *buffer, size_t size, const std::string &message) noexcept {
     if (buffer == nullptr || size == 0) {
@@ -83,6 +108,14 @@ class SpscBuffer final {
         }
         tail_.store((tail + copied) % samples_.size(), std::memory_order_release);
         return copied;
+    }
+
+    size_t discard(size_t count) noexcept {
+        const size_t tail = tail_.load(std::memory_order_relaxed);
+        const size_t head = head_.load(std::memory_order_acquire);
+        const size_t discarded = std::min(count, size_from(head, tail));
+        tail_.store((tail + discarded) % samples_.size(), std::memory_order_release);
+        return discarded;
     }
 
     size_t size() const noexcept {
@@ -181,6 +214,13 @@ struct Metrics final {
     std::atomic<uint64_t> queue_drops{0};
     std::atomic<uint64_t> decode_errors{0};
     std::atomic<uint64_t> underflows{0};
+    std::atomic<uint64_t> silence_samples{0};
+    std::atomic<uint64_t> stale_samples_dropped{0};
+    std::atomic<uint64_t> concealed_samples{0};
+    std::atomic<uint64_t> maximum_packet_gap_microseconds{0};
+    std::atomic<uint64_t> requested_samples{0};
+    std::atomic<uint64_t> maximum_requested_samples{0};
+    std::atomic<int64_t> rate_correction_ppm{0};
 };
 
 class Engine final {
@@ -189,7 +229,13 @@ class Engine final {
         : node_name_(required_string(config.node_name, "PipeWire node name")),
           node_description_(required_string(config.node_description,
                                             "PipeWire node description")),
-          queue_(queue_capacity(config.queue_capacity_ms)), decoder_() {
+          queue_capacity_samples_(queue_capacity(config.queue_capacity_ms)),
+          hard_limit_samples_(std::min(queue_capacity_samples_,
+                                       samples_for_milliseconds(kHardJitterLimitMs))),
+          queue_(queue_capacity_samples_),
+          target_samples_(std::min(hard_limit_samples_,
+                                   samples_for_milliseconds(kInitialJitterTargetMs))),
+          decoder_() {
         set_processing(config.gain_db, config.limiter_dbfs);
         static std::once_flag initialized;
         std::call_once(initialized, [] { pw_init(nullptr, nullptr); });
@@ -213,6 +259,25 @@ class Engine final {
             thread_.join();
         }
         queue_.clear();
+        target_samples_.store(
+            std::min(hard_limit_samples_,
+                     samples_for_milliseconds(kInitialJitterTargetMs)),
+            std::memory_order_release);
+        rate_match_.store(nullptr, std::memory_order_release);
+        position_.store(nullptr, std::memory_order_release);
+        buffering_ = true;
+        fill_average_seconds_ =
+            static_cast<double>(target_samples_.load(std::memory_order_relaxed)) /
+            static_cast<double>(kSampleRate);
+        rate_correction_ = 1.0;
+        position_remainder_ = 0;
+        position_rate_numerator_ = 0;
+        position_rate_denominator_ = 0;
+        last_access_unit_ = {};
+        jitter_window_started_ = {};
+        jitter_window_peak_gap_microseconds_ = 0;
+        metrics_.requested_samples.store(0, std::memory_order_relaxed);
+        metrics_.rate_correction_ppm.store(0, std::memory_order_relaxed);
 
         std::promise<std::string> ready;
         auto future = ready.get_future();
@@ -244,6 +309,7 @@ class Engine final {
             throw std::runtime_error("PipeWire virtual microphone is not running");
         }
         metrics_.access_units.fetch_add(1, std::memory_order_relaxed);
+        observe_access_unit_arrival();
 
         int16_t *samples = nullptr;
         size_t count = 0;
@@ -251,6 +317,13 @@ class Engine final {
             std::tie(samples, count) = decoder_.decode(data, size);
         } catch (const std::exception &) {
             metrics_.decode_errors.fetch_add(1, std::memory_order_relaxed);
+            if (queue_.push(kConcealmentSilence.data(),
+                            kConcealmentSilence.size())) {
+                metrics_.concealed_samples.fetch_add(kConcealmentSilence.size(),
+                                                     std::memory_order_relaxed);
+            } else {
+                metrics_.queue_drops.fetch_add(1, std::memory_order_relaxed);
+            }
             return 2;
         }
 
@@ -281,6 +354,22 @@ class Engine final {
         output.queue_drops = metrics_.queue_drops.load(std::memory_order_relaxed);
         output.decode_errors = metrics_.decode_errors.load(std::memory_order_relaxed);
         output.underflows = metrics_.underflows.load(std::memory_order_relaxed);
+        output.silence_samples =
+            metrics_.silence_samples.load(std::memory_order_relaxed);
+        output.stale_samples_dropped =
+            metrics_.stale_samples_dropped.load(std::memory_order_relaxed);
+        output.concealed_samples =
+            metrics_.concealed_samples.load(std::memory_order_relaxed);
+        output.maximum_packet_gap_microseconds =
+            metrics_.maximum_packet_gap_microseconds.load(std::memory_order_relaxed);
+        output.target_samples =
+            static_cast<uint64_t>(target_samples_.load(std::memory_order_relaxed));
+        output.requested_samples =
+            metrics_.requested_samples.load(std::memory_order_relaxed);
+        output.maximum_requested_samples =
+            metrics_.maximum_requested_samples.load(std::memory_order_relaxed);
+        output.rate_correction_ppm =
+            metrics_.rate_correction_ppm.load(std::memory_order_relaxed);
         output.queued_samples = static_cast<uint64_t>(queue_.size());
     }
 
@@ -297,6 +386,51 @@ class Engine final {
             throw std::invalid_argument("audio queue capacity must be between 1 and 5000 ms");
         }
         return static_cast<size_t>(kSampleRate) * milliseconds / 1'000;
+    }
+
+    void observe_access_unit_arrival() noexcept {
+        const auto now = std::chrono::steady_clock::now();
+        if (jitter_window_started_ == std::chrono::steady_clock::time_point{}) {
+            jitter_window_started_ = now;
+        }
+        if (last_access_unit_ != std::chrono::steady_clock::time_point{}) {
+            const auto gap = std::chrono::duration_cast<std::chrono::microseconds>(
+                now - last_access_unit_);
+            const uint64_t gap_microseconds =
+                gap.count() > 0 ? static_cast<uint64_t>(gap.count()) : 0;
+            jitter_window_peak_gap_microseconds_ =
+                std::max(jitter_window_peak_gap_microseconds_, gap_microseconds);
+            update_maximum(metrics_.maximum_packet_gap_microseconds,
+                           gap_microseconds);
+        }
+        last_access_unit_ = now;
+
+        if (std::chrono::duration_cast<std::chrono::microseconds>(
+                now - jitter_window_started_)
+                .count() < static_cast<int64_t>(kJitterWindowMicroseconds)) {
+            return;
+        }
+
+        uint64_t target_microseconds =
+            jitter_window_peak_gap_microseconds_ +
+            jitter_window_peak_gap_microseconds_ / 2;
+        // ใช้ peak 1.5 เท่าแล้วปัดเป็นช่วง 20 ms เพื่อรับ packet burst โดยไม่ตรึง latency สูงตลอดเวลา
+        target_microseconds =
+            std::max(target_microseconds,
+                     static_cast<uint64_t>(kMinimumJitterTargetMs) * 1'000);
+        target_microseconds =
+            ((target_microseconds + kJitterTargetStepMicroseconds - 1) /
+             kJitterTargetStepMicroseconds) *
+            kJitterTargetStepMicroseconds;
+        target_microseconds =
+            std::min(target_microseconds,
+                     static_cast<uint64_t>(kMaximumJitterTargetMs) * 1'000);
+        const size_t target = static_cast<size_t>(
+            static_cast<uint64_t>(kSampleRate) * target_microseconds / 1'000'000);
+        target_samples_.store(std::min(target, hard_limit_samples_),
+                              std::memory_order_release);
+        jitter_window_started_ = now;
+        jitter_window_peak_gap_microseconds_ = 0;
     }
 
     void process(int16_t *samples, size_t count) noexcept {
@@ -321,6 +455,24 @@ class Engine final {
         static_cast<Engine *>(data)->process_pipewire_buffer();
     }
 
+    static void on_io_changed(void *data, uint32_t id, void *area,
+                              uint32_t size) noexcept {
+        auto *engine = static_cast<Engine *>(data);
+        if (id == SPA_IO_RateMatch) {
+            auto *rate_match =
+                area != nullptr && size >= sizeof(spa_io_rate_match)
+                    ? static_cast<spa_io_rate_match *>(area)
+                    : nullptr;
+            engine->rate_match_.store(rate_match, std::memory_order_release);
+        } else if (id == SPA_IO_Position) {
+            auto *position =
+                area != nullptr && size >= sizeof(spa_io_position)
+                    ? static_cast<spa_io_position *>(area)
+                    : nullptr;
+            engine->position_.store(position, std::memory_order_release);
+        }
+    }
+
     static void on_state_changed(void *data, enum pw_stream_state,
                                  enum pw_stream_state state,
                                  const char *) noexcept {
@@ -334,32 +486,175 @@ class Engine final {
         }
     }
 
+    size_t requested_sample_count(size_t capacity) noexcept {
+        if (capacity == 0) {
+            return 0;
+        }
+
+        spa_io_rate_match *rate_match =
+            rate_match_.load(std::memory_order_acquire);
+        if (rate_match != nullptr && rate_match->size > 0) {
+            return std::min(capacity, static_cast<size_t>(rate_match->size));
+        }
+
+        spa_io_position *position = position_.load(std::memory_order_acquire);
+        if (position != nullptr && position->clock.duration > 0 &&
+            position->clock.rate.num > 0 && position->clock.rate.denom > 0) {
+            const uint32_t numerator = position->clock.rate.num;
+            const uint32_t denominator = position->clock.rate.denom;
+            if (numerator != position_rate_numerator_ ||
+                denominator != position_rate_denominator_) {
+                position_remainder_ = 0;
+                position_rate_numerator_ = numerator;
+                position_rate_denominator_ = denominator;
+            }
+            const __uint128_t scaled =
+                static_cast<__uint128_t>(position->clock.duration) * kSampleRate *
+                    numerator +
+                position_remainder_;
+            const __uint128_t frames = scaled / denominator;
+            position_remainder_ = static_cast<uint64_t>(scaled % denominator);
+            if (frames > 0) {
+                return frames > capacity ? capacity : static_cast<size_t>(frames);
+            }
+        }
+
+        return std::min(capacity, samples_for_milliseconds(10));
+    }
+
+    void reset_rate_control(spa_io_rate_match *rate_match,
+                            size_t target_samples) noexcept {
+        fill_average_seconds_ = static_cast<double>(target_samples) /
+                                static_cast<double>(kSampleRate);
+        rate_correction_ = 1.0;
+        metrics_.rate_correction_ppm.store(0, std::memory_order_relaxed);
+        if (rate_match != nullptr) {
+            rate_match->rate = 1.0;
+            rate_match->flags &= ~SPA_IO_RATE_MATCH_FLAG_ACTIVE;
+        }
+    }
+
+    void update_rate_control(spa_io_rate_match *rate_match, size_t queued_samples,
+                             size_t target_samples,
+                             size_t requested_samples) noexcept {
+        if (rate_match == nullptr || requested_samples == 0) {
+            metrics_.rate_correction_ppm.store(0, std::memory_order_relaxed);
+            return;
+        }
+
+        const double cycle_seconds = static_cast<double>(requested_samples) /
+                                     static_cast<double>(kSampleRate);
+        const double target_seconds = static_cast<double>(target_samples) /
+                                      static_cast<double>(kSampleRate);
+        const double level_seconds = static_cast<double>(queued_samples) /
+                                     static_cast<double>(kSampleRate);
+        const double beta =
+            std::clamp(cycle_seconds / kRateControlPeriodSeconds, 0.0, 1.0);
+        const double previous_average = fill_average_seconds_;
+        fill_average_seconds_ =
+            (1.0 - beta) * previous_average + beta * level_seconds;
+        rate_correction_ +=
+            (fill_average_seconds_ - previous_average) /
+                (3.0 * kRateControlPeriodSeconds) +
+            beta * (previous_average - target_seconds) /
+                (27.0 * kRateControlPeriodSeconds);
+        rate_correction_ =
+            std::clamp(rate_correction_, 1.0 - kMaximumRateCorrection,
+                       1.0 + kMaximumRateCorrection);
+        rate_match->rate = 1.0 / rate_correction_;
+        rate_match->flags |= SPA_IO_RATE_MATCH_FLAG_ACTIVE;
+        metrics_.rate_correction_ppm.store(
+            static_cast<int64_t>(std::llround((rate_correction_ - 1.0) * 1'000'000.0)),
+            std::memory_order_relaxed);
+    }
+
     void process_pipewire_buffer() noexcept {
-        pw_buffer *buffer = pw_stream_dequeue_buffer(stream_);
-        if (buffer == nullptr || buffer->buffer == nullptr ||
-            buffer->buffer->n_datas == 0) {
+        pw_stream *stream = stream_.load(std::memory_order_acquire);
+        if (stream == nullptr) {
+            return;
+        }
+        pw_buffer *buffer = pw_stream_dequeue_buffer(stream);
+        if (buffer == nullptr) {
+            return;
+        }
+        if (buffer->buffer == nullptr || buffer->buffer->n_datas == 0) {
+            pw_stream_queue_buffer(stream, buffer);
             return;
         }
 
         spa_data &data = buffer->buffer->datas[0];
         if (data.data == nullptr || data.chunk == nullptr) {
-            pw_stream_queue_buffer(stream_, buffer);
+            pw_stream_queue_buffer(stream, buffer);
             return;
         }
 
-        const uint32_t bytes = data.maxsize - (data.maxsize % sizeof(int16_t));
+        const size_t capacity = data.maxsize / sizeof(int16_t);
+        const size_t requested_samples = requested_sample_count(capacity);
+        metrics_.requested_samples.store(requested_samples,
+                                         std::memory_order_relaxed);
+        update_maximum(metrics_.maximum_requested_samples, requested_samples);
+
         auto *output = static_cast<int16_t *>(data.data);
-        const size_t requested_samples = bytes / sizeof(int16_t);
+        spa_io_rate_match *rate_match =
+            rate_match_.load(std::memory_order_acquire);
+        const size_t target_samples =
+            std::min(target_samples_.load(std::memory_order_acquire),
+                     hard_limit_samples_);
+        if (rate_match != active_rate_match_) {
+            active_rate_match_ = rate_match;
+            reset_rate_control(rate_match, target_samples);
+        }
+
+        size_t queued_samples = queue_.size();
+        if (queued_samples > hard_limit_samples_) {
+            // ฝั่ง consumer ทิ้ง sample เก่าเพื่อกลับสู่ target โดยไม่แย่งสิทธิ์เขียนของ producer
+            const size_t discarded =
+                queue_.discard(queued_samples - target_samples);
+            metrics_.stale_samples_dropped.fetch_add(discarded,
+                                                     std::memory_order_relaxed);
+            queued_samples -= discarded;
+            reset_rate_control(rate_match, target_samples);
+        }
+
+        const size_t start_threshold =
+            std::min(queue_capacity_samples_,
+                     std::max(target_samples, requested_samples));
+        if (buffering_ && queued_samples < start_threshold) {
+            std::fill(output, output + requested_samples, 0);
+            metrics_.silence_samples.fetch_add(requested_samples,
+                                               std::memory_order_relaxed);
+            reset_rate_control(rate_match, target_samples);
+            data.chunk->offset = 0;
+            data.chunk->stride = sizeof(int16_t);
+            data.chunk->size =
+                static_cast<uint32_t>(requested_samples * sizeof(int16_t));
+            buffer->size = requested_samples;
+            pw_stream_queue_buffer(stream, buffer);
+            return;
+        }
+        if (buffering_) {
+            buffering_ = false;
+            reset_rate_control(rate_match, target_samples);
+        }
+
+        update_rate_control(rate_match, queued_samples, target_samples,
+                            requested_samples);
         const size_t copied = queue_.pop(output, requested_samples);
         std::fill(output + copied, output + requested_samples, 0);
         if (copied < requested_samples) {
             metrics_.underflows.fetch_add(1, std::memory_order_relaxed);
+            metrics_.silence_samples.fetch_add(requested_samples - copied,
+                                               std::memory_order_relaxed);
+            buffering_ = true;
+            reset_rate_control(rate_match, target_samples);
         }
 
         data.chunk->offset = 0;
         data.chunk->stride = sizeof(int16_t);
-        data.chunk->size = bytes;
-        pw_stream_queue_buffer(stream_, buffer);
+        data.chunk->size =
+            static_cast<uint32_t>(requested_samples * sizeof(int16_t));
+        buffer->size = requested_samples;
+        pw_stream_queue_buffer(stream, buffer);
     }
 
     void thread_main(std::promise<std::string> ready) noexcept {
@@ -378,7 +673,8 @@ class Engine final {
                 node_description_.c_str(), PW_KEY_MEDIA_CLASS, "Audio/Source",
                 PW_KEY_MEDIA_TYPE, "Audio", PW_KEY_NODE_VIRTUAL, "true",
                 PW_KEY_NODE_AUTOCONNECT, "false", PW_KEY_NODE_ALWAYS_PROCESS, "true",
-                PW_KEY_NODE_PAUSE_ON_IDLE, "false", nullptr);
+                PW_KEY_NODE_PAUSE_ON_IDLE, "false", PW_KEY_NODE_LATENCY,
+                kNodeLatency, nullptr);
             if (properties == nullptr) {
                 throw std::runtime_error("failed to create PipeWire properties");
             }
@@ -388,7 +684,7 @@ class Engine final {
                 .destroy = nullptr,
                 .state_changed = on_state_changed,
                 .control_info = nullptr,
-                .io_changed = nullptr,
+                .io_changed = on_io_changed,
                 .param_changed = nullptr,
                 .add_buffer = nullptr,
                 .remove_buffer = nullptr,
@@ -403,6 +699,12 @@ class Engine final {
                 throw std::runtime_error("failed to create the PipeWire source stream");
             }
 
+            {
+                std::lock_guard<std::mutex> lock(lifecycle_mutex_);
+                main_loop_ = loop;
+            }
+            stream_.store(stream, std::memory_order_release);
+
             std::array<uint8_t, 1'024> pod_buffer{};
             spa_pod_builder builder{};
             spa_pod_builder_init(&builder, pod_buffer.data(), pod_buffer.size());
@@ -413,18 +715,14 @@ class Engine final {
             format.position[0] = SPA_AUDIO_CHANNEL_MONO;
             const spa_pod *params[] = {
                 spa_format_audio_raw_build(&builder, SPA_PARAM_EnumFormat, &format)};
-            const pw_stream_flags flags = PW_STREAM_FLAG_MAP_BUFFERS;
+            const pw_stream_flags flags = static_cast<pw_stream_flags>(
+                PW_STREAM_FLAG_MAP_BUFFERS | PW_STREAM_FLAG_RT_PROCESS);
             const int status = pw_stream_connect(stream, PW_DIRECTION_OUTPUT, PW_ID_ANY,
                                                  flags, params, 1);
             if (status < 0) {
                 throw std::runtime_error("failed to connect the PipeWire source stream");
             }
 
-            {
-                std::lock_guard<std::mutex> lock(lifecycle_mutex_);
-                main_loop_ = loop;
-                stream_ = stream;
-            }
             running_.store(true, std::memory_order_release);
             ready.set_value({});
             pw_main_loop_run(loop);
@@ -442,13 +740,16 @@ class Engine final {
             }
         }
 
-        {
-            std::lock_guard<std::mutex> lock(lifecycle_mutex_);
-            stream_ = nullptr;
-            main_loop_ = nullptr;
-        }
         if (stream != nullptr) {
             pw_stream_destroy(stream);
+        }
+        stream_.store(nullptr, std::memory_order_release);
+        rate_match_.store(nullptr, std::memory_order_release);
+        position_.store(nullptr, std::memory_order_release);
+        active_rate_match_ = nullptr;
+        {
+            std::lock_guard<std::mutex> lock(lifecycle_mutex_);
+            main_loop_ = nullptr;
         }
         if (loop != nullptr) {
             pw_main_loop_destroy(loop);
@@ -458,16 +759,31 @@ class Engine final {
 
     std::string node_name_;
     std::string node_description_;
+    const size_t queue_capacity_samples_;
+    const size_t hard_limit_samples_;
     SpscBuffer queue_;
+    std::atomic<size_t> target_samples_;
     Decoder decoder_;
     Metrics metrics_;
+    std::atomic<spa_io_rate_match *> rate_match_{nullptr};
+    std::atomic<spa_io_position *> position_{nullptr};
+    spa_io_rate_match *active_rate_match_{nullptr};
+    bool buffering_{true};
+    double fill_average_seconds_{0.0};
+    double rate_correction_{1.0};
+    uint64_t position_remainder_{0};
+    uint32_t position_rate_numerator_{0};
+    uint32_t position_rate_denominator_{0};
+    std::chrono::steady_clock::time_point last_access_unit_{};
+    std::chrono::steady_clock::time_point jitter_window_started_{};
+    uint64_t jitter_window_peak_gap_microseconds_{0};
     float gain_linear_{1.0F};
     float limit_sample_{static_cast<float>(std::numeric_limits<int16_t>::max())};
     float limiter_gain_{1.0F};
     std::atomic<bool> running_{false};
     std::mutex lifecycle_mutex_;
     pw_main_loop *main_loop_{nullptr};
-    pw_stream *stream_{nullptr};
+    std::atomic<pw_stream *> stream_{nullptr};
     std::thread thread_;
 };
 

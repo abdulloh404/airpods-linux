@@ -42,6 +42,14 @@ struct NativeMetrics {
     queue_drops: u64,
     decode_errors: u64,
     underflows: u64,
+    silence_samples: u64,
+    stale_samples_dropped: u64,
+    concealed_samples: u64,
+    maximum_packet_gap_microseconds: u64,
+    target_samples: u64,
+    requested_samples: u64,
+    maximum_requested_samples: u64,
+    rate_correction_ppm: i64,
     queued_samples: u64,
 }
 
@@ -84,7 +92,7 @@ pub struct AudioConfig {
     pub gain_db: f32,
     /// เพดาน limiter หน่วย dBFS
     pub limiter_dbfs: f32,
-    /// ความจุ bounded SPSC buffer หน่วย millisecond
+    /// ความจุสูงสุดของ bounded SPSC physical queue หน่วย millisecond
     pub queue_capacity_ms: u32,
 }
 
@@ -105,9 +113,9 @@ impl Default for AudioConfig {
 pub enum PushOutcome {
     /// decode สำเร็จและใส่ PCM ลง queue แล้ว
     Queued,
-    /// decode สำเร็จแต่ queue เต็ม จึงทิ้งทั้ง frame
+    /// decode สำเร็จแต่ physical queue เต็ม จึงทิ้งทั้ง frame
     QueueFull,
-    /// FDK-AAC ปฏิเสธ access unit นี้ โดย engine ยังทำงานต่อได้
+    /// FDK-AAC ปฏิเสธ access unit นี้และแทน frame ที่เสียด้วย silence
     DecodeError,
 }
 
@@ -126,6 +134,22 @@ pub struct AudioMetrics {
     pub decode_errors: u64,
     /// จำนวน PipeWire buffer callback ที่เติม silence อย่างน้อยหนึ่ง sample
     pub underflows: u64,
+    /// จำนวน silence sample ที่ส่งระหว่างเริ่ม buffer ใหม่หรือเกิด underflow
+    pub silence_samples: u64,
+    /// จำนวน sample เก่าที่ทิ้งเพื่อจำกัด latency
+    pub stale_samples_dropped: u64,
+    /// จำนวน silence sample ที่แทน AAC frame ซึ่ง decode ไม่สำเร็จ
+    pub concealed_samples: u64,
+    /// ช่องว่างระหว่าง access unit ที่มากที่สุด หน่วย microsecond
+    pub maximum_packet_gap_microseconds: u64,
+    /// jitter target ปัจจุบัน หน่วย sample
+    pub target_samples: u64,
+    /// จำนวน sample ที่ PipeWire ขอล่าสุด
+    pub requested_samples: u64,
+    /// จำนวน sample มากที่สุดที่ PipeWire เคยขอใน callback เดียว
+    pub maximum_requested_samples: u64,
+    /// ค่าชดเชย clock drift ปัจจุบัน หน่วย parts per million
+    pub rate_correction_ppm: i64,
     /// จำนวน PCM sample ที่รออยู่ใน queue ขณะอ่าน metric
     pub queued_samples: u64,
 }
@@ -233,6 +257,14 @@ impl AudioEngine {
             queue_drops: native.queue_drops,
             decode_errors: native.decode_errors,
             underflows: native.underflows,
+            silence_samples: native.silence_samples,
+            stale_samples_dropped: native.stale_samples_dropped,
+            concealed_samples: native.concealed_samples,
+            maximum_packet_gap_microseconds: native.maximum_packet_gap_microseconds,
+            target_samples: native.target_samples,
+            requested_samples: native.requested_samples,
+            maximum_requested_samples: native.maximum_requested_samples,
+            rate_correction_ppm: native.rate_correction_ppm,
             queued_samples: native.queued_samples,
         }
     }

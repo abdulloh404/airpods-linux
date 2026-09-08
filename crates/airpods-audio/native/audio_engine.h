@@ -25,6 +25,14 @@ typedef struct airpods_audio_metrics {
     uint64_t queue_drops;
     uint64_t decode_errors;
     uint64_t underflows;
+    uint64_t silence_samples;
+    uint64_t stale_samples_dropped;
+    uint64_t concealed_samples;
+    uint64_t maximum_packet_gap_microseconds;
+    uint64_t target_samples;
+    uint64_t requested_samples;
+    uint64_t maximum_requested_samples;
+    int64_t rate_correction_ppm;
     uint64_t queued_samples;
 } airpods_audio_metrics;
 
