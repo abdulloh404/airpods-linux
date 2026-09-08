@@ -13,7 +13,7 @@ pub const CHANNELS: u8 = 1;
 pub const SOURCE_NAME: &str = "Microphone_Virtual_Abdullohs_AirPods_Pro";
 pub const SOURCE_DESCRIPTION: &str = "Microphone virtual - Abdulloh's AirPods Pro";
 /// gain เริ่มต้นก่อนเข้า limiter
-pub const DEFAULT_GAIN_DB: f32 = 18.0;
+pub const DEFAULT_GAIN_DB: f32 = 0.0;
 /// limiter เริ่มต้นหน่วย dBFS
 pub const DEFAULT_LIMITER_DBFS: f32 = -3.0;
 
