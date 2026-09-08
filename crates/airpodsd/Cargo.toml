@@ -13,6 +13,7 @@ airpods-ipc = { path = "../airpods-ipc" }
 anyhow.workspace = true
 bluer.workspace = true
 dirs = "6"
+futures-util.workspace = true
 serde.workspace = true
 tokio = { workspace = true, features = ["fs", "io-util", "process"] }
 toml.workspace = true

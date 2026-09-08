@@ -8,7 +8,7 @@ use airpods_core::framing::{demux_audio_sdu, is_audio_sdu};
 use anyhow::{Context, bail};
 use tokio::sync::{mpsc, oneshot, watch, Mutex};
 
-use crate::service::{DesiredAudio, Event, SharedState};
+use crate::{bluez, service::{DesiredAudio, Event, SharedState}};
 
 const FIRST_AUDIO_TIMEOUT: Duration = Duration::from_secs(3);
 const AUDIO_STALL_TIMEOUT: Duration = Duration::from_secs(3);
@@ -128,6 +128,23 @@ async fn stream_once(
         Ok(address) => address,
         Err(error) => return AttemptExit::Failed(error.to_string()),
     };
+    let connected = tokio::select! {
+        result = bluez::wait_until_connected(address) => result,
+        changed = desired.changed() => {
+            return if changed.is_err() {
+                AttemptExit::Shutdown
+            } else {
+                AttemptExit::Reconfigure
+            };
+        }
+        _ = shutdown.changed() => return AttemptExit::Shutdown,
+    };
+    if let Err(error) = connected {
+        return AttemptExit::Failed(error.to_string());
+    }
+    if let Some(exit) = stale_startup(desired, shutdown, &target) {
+        return exit;
+    }
     let connection = tokio::select! {
         result = AacpSession::connect(address) => result,
         changed = desired.changed() => {

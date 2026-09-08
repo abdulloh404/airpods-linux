@@ -1,10 +1,51 @@
-//! อ่านรายการ AirPods จาก BlueZ เพื่อให้ daemon เป็นเจ้าของ device inventory เพียงจุดเดียว
+//! อ่านรายการและติดตามสถานะ AirPods ผ่าน BlueZ โดยไม่สั่งเชื่อมอุปกรณ์
 
 use std::collections::HashMap;
 
 use airpods_ipc::DeviceInfo;
+use anyhow::{Context, bail};
+use bluer::{Address, DeviceEvent, DeviceProperty, Session};
+use futures_util::{StreamExt, pin_mut};
 use zbus::fdo::ObjectManagerProxy;
 use zvariant::OwnedValue;
+
+/// รอจน BlueZ รายงานว่าอุปกรณ์เชื่อมแล้ว โดยไม่สั่งเชื่อมอุปกรณ์เอง
+pub async fn wait_until_connected(address: Address) -> anyhow::Result<()> {
+    let session = Session::new()
+        .await
+        .context("failed to connect to BlueZ while waiting for AirPods")?;
+    let adapter = session
+        .default_adapter()
+        .await
+        .context("failed to get the Bluetooth adapter while waiting for AirPods")?;
+    let device = adapter
+        .device(address)
+        .context("failed to access the selected AirPods in BlueZ")?;
+    let events = device
+        .events()
+        .await
+        .context("failed to monitor the selected AirPods connection")?;
+    pin_mut!(events);
+
+    if device
+        .is_connected()
+        .await
+        .context("failed to read the selected AirPods connection state")?
+    {
+        return Ok(());
+    }
+
+    while let Some(event) = events.next().await {
+        if matches!(
+            event,
+            DeviceEvent::PropertyChanged(DeviceProperty::Connected(true))
+        ) {
+            return Ok(());
+        }
+    }
+
+    bail!("selected AirPods disappeared from BlueZ while waiting for connection")
+}
 
 pub async fn list_airpods(selected: &str) -> zbus::Result<Vec<DeviceInfo>> {
     let connection = zbus::Connection::system().await?;
