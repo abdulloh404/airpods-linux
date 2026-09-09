@@ -2,11 +2,12 @@
 
 use std::sync::Arc;
 
+use airpods_core::aacp::ListeningMode;
 use airpods_ipc::{
     BatteryStatus, DaemonStatus, DeviceInfo, MAX_GAIN_DB, MAX_LIMITER_DB, MIN_GAIN_DB,
     MIN_LIMITER_DB,
 };
-use tokio::sync::{mpsc, watch, Mutex, RwLock};
+use tokio::sync::{Mutex, RwLock, mpsc, oneshot, watch};
 
 use crate::config::{Config, ConfigStore};
 
@@ -26,6 +27,33 @@ impl DesiredAudio {
             gain_db: config.gain_db,
             limiter_db: config.limiter_db,
         }
+    }
+}
+
+/// คำขอเปลี่ยน listening mode ที่ D-Bus ส่งให้ AACP lifecycle worker
+#[derive(Debug)]
+pub struct ModeRequest {
+    pub address: String,
+    pub mode: ListeningMode,
+    response: oneshot::Sender<Result<(), String>>,
+}
+
+impl ModeRequest {
+    pub fn new(
+        address: String,
+        mode: ListeningMode,
+        response: oneshot::Sender<Result<(), String>>,
+    ) -> Self {
+        Self {
+            address,
+            mode,
+            response,
+        }
+    }
+
+    /// ส่งผลลัพธ์กลับไปยัง D-Bus method ที่รออยู่
+    pub fn respond(self, result: Result<(), String>) {
+        let _ = self.response.send(result);
     }
 }
 
@@ -69,6 +97,7 @@ pub struct ManagerService {
     config: Arc<Mutex<Config>>,
     config_store: ConfigStore,
     desired: watch::Sender<DesiredAudio>,
+    mode_requests: mpsc::Sender<ModeRequest>,
     events: mpsc::UnboundedSender<Event>,
 }
 
@@ -78,6 +107,7 @@ impl ManagerService {
         config: Config,
         config_store: ConfigStore,
         desired: watch::Sender<DesiredAudio>,
+        mode_requests: mpsc::Sender<ModeRequest>,
         events: mpsc::UnboundedSender<Event>,
     ) -> Self {
         Self {
@@ -85,6 +115,7 @@ impl ManagerService {
             config: Arc::new(Mutex::new(config)),
             config_store,
             desired,
+            mode_requests,
             events,
         }
     }
@@ -127,9 +158,7 @@ impl ManagerService {
             let mut state = self.state.write().await;
             state.status.selected_device = next.selected_device.clone();
             for device in &mut state.devices {
-                device.selected = device
-                    .address
-                    .eq_ignore_ascii_case(&next.selected_device);
+                device.selected = device.address.eq_ignore_ascii_case(&next.selected_device);
             }
             state.devices.clone()
         };
@@ -210,6 +239,34 @@ impl ManagerService {
         Ok(())
     }
 
+    async fn set_listening_mode(&self, mode: &str) -> zbus::fdo::Result<()> {
+        let mode = ListeningMode::parse(mode).ok_or_else(|| {
+            zbus::fdo::Error::InvalidArgs(
+                "mode must be one of: off, anc, transparency, adaptive".to_string(),
+            )
+        })?;
+        let address = self.config.lock().await.selected_device.clone();
+        if address.is_empty() {
+            return Err(zbus::fdo::Error::Failed(
+                "no AirPods device is selected".to_string(),
+            ));
+        }
+
+        let (response_tx, response_rx) = oneshot::channel();
+        self.mode_requests
+            .send(ModeRequest::new(address, mode, response_tx))
+            .await
+            .map_err(|_| {
+                zbus::fdo::Error::Failed("AACP lifecycle worker is unavailable".to_string())
+            })?;
+        response_rx
+            .await
+            .map_err(|_| {
+                zbus::fdo::Error::Failed("AACP lifecycle worker stopped responding".to_string())
+            })?
+            .map_err(zbus::fdo::Error::Failed)
+    }
+
     async fn battery(&self) -> BatteryStatus {
         self.state.read().await.battery
     }
@@ -236,7 +293,7 @@ impl ManagerService {
 fn valid_bluetooth_address(address: &str) -> bool {
     let parts: Vec<_> = address.split(':').collect();
     parts.len() == 6
-        && parts
-            .iter()
-            .all(|part| part.len() == 2 && part.chars().all(|character| character.is_ascii_hexdigit()))
+        && parts.iter().all(|part| {
+            part.len() == 2 && part.chars().all(|character| character.is_ascii_hexdigit())
+        })
 }

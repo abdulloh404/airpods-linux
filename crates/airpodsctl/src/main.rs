@@ -2,7 +2,7 @@
 
 use airpods_ipc::{BatteryStatus, DaemonStatus, ManagerProxy};
 use anyhow::{Context, Result};
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 
 #[derive(Debug, Parser)]
 #[command(name = "airpodsctl", version, about = "Control AirPods on Linux")]
@@ -25,8 +25,32 @@ enum Command {
         #[command(subcommand)]
         command: MicCommand,
     },
+    /// Set the AirPods listening mode.
+    Mode {
+        #[arg(value_enum)]
+        mode: Mode,
+    },
     /// Show left and right battery values.
     Battery,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum Mode {
+    Off,
+    Anc,
+    Transparency,
+    Adaptive,
+}
+
+impl Mode {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Anc => "anc",
+            Self::Transparency => "transparency",
+            Self::Adaptive => "adaptive",
+        }
+    }
 }
 
 #[derive(Debug, Subcommand)]
@@ -76,7 +100,10 @@ async fn main() -> Result<()> {
                         } else {
                             "disconnected"
                         };
-                        println!("{selected} {}  {}  {connected}", device.address, device.name);
+                        println!(
+                            "{selected} {}  {}  {connected}",
+                            device.address, device.name
+                        );
                     }
                 }
             }
@@ -104,6 +131,10 @@ async fn main() -> Result<()> {
                 println!("Limiter set to {db:.1} dBFS.");
             }
         },
+        Command::Mode { mode } => {
+            proxy.set_listening_mode(mode.as_str()).await?;
+            println!("Listening mode command sent: {}.", mode.as_str());
+        }
         Command::Battery => print_battery(proxy.battery().await?),
     }
     Ok(())

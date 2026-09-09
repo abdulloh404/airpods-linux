@@ -3,12 +3,15 @@
 use std::time::Duration;
 
 use airpods_audio::{AudioConfig, AudioEngine, PushOutcome};
-use airpods_core::aacp::AacpSession;
+use airpods_core::aacp::{AacpSession, ListeningMode};
 use airpods_core::framing::{demux_audio_sdu, is_audio_sdu};
 use anyhow::{Context, bail};
-use tokio::sync::{mpsc, oneshot, watch, Mutex};
+use tokio::sync::{Mutex, mpsc, oneshot, watch};
 
-use crate::{bluez, service::{DesiredAudio, Event, SharedState}};
+use crate::{
+    bluez,
+    service::{DesiredAudio, Event, ModeRequest, SharedState},
+};
 
 const FIRST_AUDIO_TIMEOUT: Duration = Duration::from_secs(3);
 const AUDIO_STALL_TIMEOUT: Duration = Duration::from_secs(3);
@@ -16,6 +19,7 @@ const DECODE_ERROR_LIMIT: u32 = 64;
 const QUEUE_FULL_LIMIT: u32 = 256;
 const A2DP_RESET_DELAY: Duration = Duration::from_millis(800);
 const AACP_STOP_SETTLE_DELAY: Duration = Duration::from_millis(200);
+const AACP_CONTROL_SETTLE_DELAY: Duration = Duration::from_millis(100);
 const PACTL_TIMEOUT: Duration = Duration::from_secs(2);
 const A2DP_RESTORE_ATTEMPTS: usize = 3;
 const A2DP_RESTORE_RETRY_DELAY: Duration = Duration::from_millis(100);
@@ -37,6 +41,7 @@ pub async fn lifecycle_loop(
     state: SharedState,
     events: mpsc::UnboundedSender<Event>,
     mut desired: watch::Receiver<DesiredAudio>,
+    mut mode_requests: mpsc::Receiver<ModeRequest>,
     mut shutdown: watch::Receiver<bool>,
 ) {
     let mut reconnect_attempt = 0_u32;
@@ -49,7 +54,7 @@ pub async fn lifecycle_loop(
         if !target.enabled {
             set_audio_status(&state, &events, "idle", false, 0, None).await;
             reconnect_attempt = 0;
-            if !wait_for_change(&mut desired, &mut shutdown).await {
+            if !wait_for_action(&mut desired, &mut mode_requests, &mut shutdown).await {
                 break;
             }
             continue;
@@ -64,7 +69,7 @@ pub async fn lifecycle_loop(
                 Some("no AirPods device is selected".to_string()),
             )
             .await;
-            if !wait_for_change(&mut desired, &mut shutdown).await {
+            if !wait_for_action(&mut desired, &mut mode_requests, &mut shutdown).await {
                 break;
             }
             continue;
@@ -79,7 +84,16 @@ pub async fn lifecycle_loop(
             None,
         )
         .await;
-        match stream_once(&state, &events, &mut desired, &mut shutdown, target).await {
+        match stream_once(
+            &state,
+            &events,
+            &mut desired,
+            &mut mode_requests,
+            &mut shutdown,
+            target,
+        )
+        .await
+        {
             AttemptExit::Shutdown => break,
             AttemptExit::Reconfigure => {
                 reconnect_attempt = 0;
@@ -109,6 +123,10 @@ pub async fn lifecycle_loop(
                             break;
                         }
                     }
+                    Some(request) = mode_requests.recv() => {
+                        send_mode_without_audio(request).await;
+                        reconnect_attempt = 0;
+                    }
                 }
             }
         }
@@ -121,14 +139,17 @@ async fn stream_once(
     state: &SharedState,
     events: &mpsc::UnboundedSender<Event>,
     desired: &mut watch::Receiver<DesiredAudio>,
+    mode_requests: &mut mpsc::Receiver<ModeRequest>,
     shutdown: &mut watch::Receiver<bool>,
     mut target: DesiredAudio,
 ) -> AttemptExit {
-    let address: bluer::Address = match target.address.parse().context("invalid Bluetooth address") {
+    let address: bluer::Address = match target.address.parse().context("invalid Bluetooth address")
+    {
         Ok(address) => address,
         Err(error) => return AttemptExit::Failed(error.to_string()),
     };
     let connected = tokio::select! {
+        biased;
         result = bluez::wait_until_connected(address) => result,
         changed = desired.changed() => {
             return if changed.is_err() {
@@ -138,6 +159,10 @@ async fn stream_once(
             };
         }
         _ = shutdown.changed() => return AttemptExit::Shutdown,
+        Some(request) = mode_requests.recv() => {
+            send_mode_without_audio(request).await;
+            return AttemptExit::Reconfigure;
+        }
     };
     if let Err(error) = connected {
         return AttemptExit::Failed(error.to_string());
@@ -146,6 +171,7 @@ async fn stream_once(
         return exit;
     }
     let connection = tokio::select! {
+        biased;
         result = AacpSession::connect(address) => result,
         changed = desired.changed() => {
             return if changed.is_err() {
@@ -155,12 +181,17 @@ async fn stream_once(
             };
         }
         _ = shutdown.changed() => return AttemptExit::Shutdown,
+        Some(request) = mode_requests.recv() => {
+            send_mode_without_audio(request).await;
+            return AttemptExit::Reconfigure;
+        }
     };
     let mut session = match connection {
         Ok(session) => session,
         Err(error) => return AttemptExit::Failed(error.to_string()),
     };
     let initialization = tokio::select! {
+        biased;
         result = session.initialize() => result,
         changed = desired.changed() => {
             return if changed.is_err() {
@@ -170,6 +201,10 @@ async fn stream_once(
             };
         }
         _ = shutdown.changed() => return AttemptExit::Shutdown,
+        Some(request) = mode_requests.recv() => {
+            send_mode_without_audio(request).await;
+            return AttemptExit::Reconfigure;
+        }
     };
     if let Err(error) = initialization {
         return AttemptExit::Failed(error.to_string());
@@ -264,6 +299,17 @@ async fn stream_once(
                 if changed.is_err() || *shutdown.borrow() {
                     break AttemptExit::Shutdown;
                 }
+            }
+            Some(request) = mode_requests.recv() => {
+                let result = if request.address.eq_ignore_ascii_case(&target.address) {
+                    session
+                        .set_listening_mode(request.mode)
+                        .await
+                        .map_err(|error| error.to_string())
+                } else {
+                    Err("selected AirPods changed before the mode command was sent".to_string())
+                };
+                request.respond(result);
             }
             _ = watchdog.tick() => {
                 let timed_out = match last_queued_audio {
@@ -427,10 +473,7 @@ async fn set_card_profile(card: &str, profile: &str) -> anyhow::Result<()> {
 
 async fn run_pactl(args: &[&str]) -> anyhow::Result<std::process::Output> {
     let mut command = tokio::process::Command::new("pactl");
-    command
-        .env("LC_ALL", "C")
-        .args(args)
-        .kill_on_drop(true);
+    command.env("LC_ALL", "C").args(args).kill_on_drop(true);
     tokio::time::timeout(PACTL_TIMEOUT, command.output())
         .await
         .context("pactl command timed out")?
@@ -451,14 +494,42 @@ fn stale_startup(
     None
 }
 
-async fn wait_for_change(
+async fn wait_for_action(
     desired: &mut watch::Receiver<DesiredAudio>,
+    mode_requests: &mut mpsc::Receiver<ModeRequest>,
     shutdown: &mut watch::Receiver<bool>,
 ) -> bool {
     tokio::select! {
         changed = desired.changed() => changed.is_ok(),
         changed = shutdown.changed() => changed.is_ok() && !*shutdown.borrow(),
+        Some(request) = mode_requests.recv() => {
+            send_mode_without_audio(request).await;
+            true
+        }
     }
+}
+
+async fn send_mode_without_audio(request: ModeRequest) {
+    let result = send_mode_once(&request.address, request.mode)
+        .await
+        .map_err(|error| error.to_string());
+    request.respond(result);
+}
+
+async fn send_mode_once(address: &str, mode: ListeningMode) -> anyhow::Result<()> {
+    let address = address
+        .parse()
+        .context("invalid selected Bluetooth address")?;
+    if !bluez::is_connected(address).await? {
+        bail!("selected AirPods are not connected");
+    }
+
+    let session = AacpSession::connect(address).await?;
+    session.initialize().await?;
+    session.set_listening_mode(mode).await?;
+    // เปิดเวลาให้ Bluetooth stack ส่ง packet ก่อนปิด AACP session ชั่วคราว
+    tokio::time::sleep(AACP_CONTROL_SETTLE_DELAY).await;
+    Ok(())
 }
 
 async fn set_audio_status(

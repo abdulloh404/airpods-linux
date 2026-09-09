@@ -13,8 +13,10 @@ KERNEL_MODULE := kernel/airpods-power/airpods_power.ko
 
 AIRPODS_USER := $(if $(SUDO_USER),$(SUDO_USER),$(shell id -un))
 AIRPODS_USER_HOME := $(shell getent passwd "$(AIRPODS_USER)" | cut -d: -f6)
+AIRPODS_USER_ID := $(shell id -u "$(AIRPODS_USER)")
+AIRPODS_USER_RUNTIME_DIR := /run/user/$(AIRPODS_USER_ID)
 
-.PHONY: all build install uninstall clean check-root check-artifacts check-user-home
+.PHONY: all build install uninstall clean check-root check-artifacts check-user-home check-user-session
 
 all: build
 
@@ -37,7 +39,10 @@ check-user-home:
 		*) echo "Cannot safely resolve the home directory for $(AIRPODS_USER)."; exit 1 ;; \
 	esac
 
-install: check-root check-artifacts
+check-user-session:
+	@test -S "$(AIRPODS_USER_RUNTIME_DIR)/bus" || { echo "No active D-Bus session for $(AIRPODS_USER). Log in as that user before installing."; exit 1; }
+
+install: check-root check-artifacts check-user-home check-user-session
 	install -Dm755 "$(DAEMON_BINARY)" "$(BIN_DIR)/airpodsd"
 	install -Dm755 "$(CLI_BINARY)" "$(BIN_DIR)/airpodsctl"
 	install -Dm755 "$(GUI_BINARY)" "$(BIN_DIR)/airpods-gui"
@@ -48,10 +53,16 @@ install: check-root check-artifacts
 	install -Dm644 modules-load/airpods-power.conf "$(MODULES_LOAD_DIR)/airpods-power.conf"
 	depmod -a "$(KERNEL_RELEASE)"
 	udevadm control --reload-rules
-	@echo "Installed airpodsd, airpodsctl, airpods-gui, the user service, and the kernel bridge."
+	systemctl --user --machine="$(AIRPODS_USER)@.host" daemon-reload
+	systemctl --user --machine="$(AIRPODS_USER)@.host" enable airpodsd.service
+	systemctl --user --machine="$(AIRPODS_USER)@.host" restart airpodsd.service
+	runuser -u "$(AIRPODS_USER)" -- env \
+		XDG_RUNTIME_DIR="$(AIRPODS_USER_RUNTIME_DIR)" \
+		DBUS_SESSION_BUS_ADDRESS="unix:path=$(AIRPODS_USER_RUNTIME_DIR)/bus" \
+		"$(BIN_DIR)/airpodsctl" mic start
+	@echo "Installed airpodsd, airpodsctl, airpods-gui, the enabled user service, and the kernel bridge."
+	@echo "Started airpodsd and enabled the virtual microphone for $(AIRPODS_USER)."
 	@echo "Load now if needed: sudo modprobe airpods_power"
-	@echo "Run as $(AIRPODS_USER): systemctl --user daemon-reload"
-	@echo "Run as $(AIRPODS_USER): systemctl --user enable --now airpodsd.service"
 
 uninstall: check-root check-user-home
 	-@systemctl --user --machine="$(AIRPODS_USER)@.host" disable --now airpodsd.service >/dev/null 2>&1

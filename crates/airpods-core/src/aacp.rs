@@ -24,6 +24,42 @@ const AACP_START_AUDIO: [u8; 19] = [
 const AACP_STOP_AUDIO: [u8; 12] = [
     0x04, 0x00, 0x04, 0x00, 0x58, 0x00, 0x00, 0x00, 0x02, 0x00, 0x03, 0x01,
 ];
+const AACP_SET_LISTENING_MODE: [u8; 11] = [
+    0x04, 0x00, 0x04, 0x00, 0x09, 0x00, 0x0D, 0x00, 0x00, 0x00, 0x00,
+];
+
+/// listening mode ที่ AirPods รองรับผ่าน AACP control command `0x0D`
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+pub enum ListeningMode {
+    Off = 0x01,
+    NoiseCancellation = 0x02,
+    Transparency = 0x03,
+    Adaptive = 0x04,
+}
+
+impl ListeningMode {
+    /// แปลงชื่อที่ใช้ใน CLI และ D-Bus เป็น listening mode
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "off" => Some(Self::Off),
+            "anc" => Some(Self::NoiseCancellation),
+            "transparency" => Some(Self::Transparency),
+            "adaptive" => Some(Self::Adaptive),
+            _ => None,
+        }
+    }
+
+    /// คืนชื่อคงที่ที่ใช้แสดงใน CLI และ log
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::NoiseCancellation => "anc",
+            Self::Transparency => "transparency",
+            Self::Adaptive => "adaptive",
+        }
+    }
+}
 
 /// AACP transport หนึ่ง session สำหรับ AirPods หนึ่งคู่
 pub struct AacpSession {
@@ -99,6 +135,17 @@ impl AacpSession {
             .context("AACP microphone STOP failed")?;
         self.started = false;
         info!("[aacp] hi-res microphone STOP sent");
+        Ok(())
+    }
+
+    /// ส่ง AACP control command เพื่อเปลี่ยน listening mode ของ AirPods
+    pub async fn set_listening_mode(&self, mode: ListeningMode) -> Result<()> {
+        let mut packet = AACP_SET_LISTENING_MODE;
+        packet[7] = mode as u8;
+        self.send(&packet)
+            .await
+            .context("failed to set AirPods listening mode")?;
+        info!("[aacp] listening mode command sent: {}", mode.as_str());
         Ok(())
     }
 

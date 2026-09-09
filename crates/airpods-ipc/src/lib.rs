@@ -85,6 +85,8 @@ pub trait Manager {
 
     fn set_limiter_db(&self, limiter_db: f64) -> zbus::Result<()>;
 
+    fn set_listening_mode(&self, mode: &str) -> zbus::Result<()>;
+
     fn battery(&self) -> zbus::Result<BatteryStatus>;
 
     #[zbus(signal)]

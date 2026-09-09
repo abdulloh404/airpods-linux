@@ -12,7 +12,7 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use service::{DesiredAudio, Event, ManagerService, RuntimeState};
-use tokio::sync::{mpsc, watch, RwLock};
+use tokio::sync::{RwLock, mpsc, watch};
 
 use airpods_ipc::{BUS_NAME, MANAGER_INTERFACE, OBJECT_PATH};
 
@@ -34,12 +34,14 @@ async fn main() -> Result<()> {
     let (desired_tx, desired_rx) = watch::channel(DesiredAudio::from_config(&config));
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let (event_tx, event_rx) = mpsc::unbounded_channel();
+    let (mode_tx, mode_rx) = mpsc::channel(8);
 
     let service = ManagerService::new(
         state.clone(),
         config,
         config_store,
         desired_tx.clone(),
+        mode_tx,
         event_tx.clone(),
     );
     let connection = zbus::connection::Builder::session()?
@@ -53,6 +55,7 @@ async fn main() -> Result<()> {
         state.clone(),
         event_tx.clone(),
         desired_rx,
+        mode_rx,
         shutdown_rx.clone(),
     ));
     let inventory_task = tokio::spawn(workers::inventory_loop(
@@ -79,10 +82,7 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-async fn emit_events(
-    connection: zbus::Connection,
-    mut events: mpsc::UnboundedReceiver<Event>,
-) {
+async fn emit_events(connection: zbus::Connection, mut events: mpsc::UnboundedReceiver<Event>) {
     while let Some(event) = events.recv().await {
         let result = match event {
             Event::Status(status) => {

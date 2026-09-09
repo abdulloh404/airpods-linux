@@ -33,9 +33,25 @@ is kept in `systemd/airpodsd.service` for later installation work.
 Neither client edits configuration files, invokes `systemctl`, nor connects to
 the AirPods directly.
 
+Set the listening mode through the daemon-owned AACP session:
+
+```bash
+airpodsctl mode off
+airpodsctl mode anc
+airpodsctl mode transparency
+airpodsctl mode adaptive
+```
+
 The kernel battery bridge is optional for audio operation. Without it, exact
 Left and Right values remain available through `airpodsctl` and `airpods-gui`,
 but stock UPower cannot represent both values as separate devices.
+
+## Protocol reference
+
+The vendored [AACP control-command reference](docs/references/librepods-control-commands.md)
+comes from the GPL-3.0 licensed
+[`librepods-org/librepods`](https://github.com/librepods-org/librepods)
+repository at commit `53679cc90222e94ade84e66542d97ace2540e626`.
 
 ## Build
 

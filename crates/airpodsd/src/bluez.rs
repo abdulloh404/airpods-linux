@@ -9,6 +9,24 @@ use futures_util::{StreamExt, pin_mut};
 use zbus::fdo::ObjectManagerProxy;
 use zvariant::OwnedValue;
 
+/// อ่านสถานะการเชื่อมต่อปัจจุบันจาก BlueZ โดยไม่สั่งเชื่อมอุปกรณ์
+pub async fn is_connected(address: Address) -> anyhow::Result<bool> {
+    let session = Session::new()
+        .await
+        .context("failed to connect to BlueZ while checking AirPods")?;
+    let adapter = session
+        .default_adapter()
+        .await
+        .context("failed to get the Bluetooth adapter while checking AirPods")?;
+    let device = adapter
+        .device(address)
+        .context("failed to access the selected AirPods in BlueZ")?;
+    device
+        .is_connected()
+        .await
+        .context("failed to read the selected AirPods connection state")
+}
+
 /// รอจน BlueZ รายงานว่าอุปกรณ์เชื่อมแล้ว โดยไม่สั่งเชื่อมอุปกรณ์เอง
 pub async fn wait_until_connected(address: Address) -> anyhow::Result<()> {
     let session = Session::new()
