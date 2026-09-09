@@ -2,7 +2,7 @@
 
 use airpods_ipc::{BatteryStatus, DaemonStatus, ManagerProxy};
 use anyhow::{Context, Result};
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{Parser, Subcommand};
 
 #[derive(Debug, Parser)]
 #[command(name = "airpodsctl", version, about = "Control AirPods on Linux")]
@@ -26,23 +26,30 @@ enum Command {
         command: MicCommand,
     },
     /// Set the AirPods listening mode.
+    #[command(
+        after_help = "Suggestions:\n  adaptive      Everyday use on supported models\n  anc           Noisy environments\n  transparency  Conversations or environmental awareness\n  off           Disable Noise Control"
+    )]
     Mode {
-        #[arg(value_enum)]
-        mode: Mode,
+        #[command(subcommand)]
+        command: ModeCommand,
     },
     /// Show left and right battery values.
     Battery,
 }
 
-#[derive(Clone, Copy, Debug, ValueEnum)]
-enum Mode {
+#[derive(Clone, Copy, Debug, Subcommand)]
+enum ModeCommand {
+    /// Turn off both ANC and Transparency.
     Off,
+    /// Reduce outside noise; recommended in noisy environments.
     Anc,
+    /// Let surrounding sound in for conversations or environmental awareness.
     Transparency,
+    /// Automatically blend ANC and Transparency on supported AirPods models.
     Adaptive,
 }
 
-impl Mode {
+impl ModeCommand {
     fn as_str(self) -> &'static str {
         match self {
             Self::Off => "off",
@@ -131,9 +138,9 @@ async fn main() -> Result<()> {
                 println!("Limiter set to {db:.1} dBFS.");
             }
         },
-        Command::Mode { mode } => {
-            proxy.set_listening_mode(mode.as_str()).await?;
-            println!("Listening mode command sent: {}.", mode.as_str());
+        Command::Mode { command } => {
+            proxy.set_listening_mode(command.as_str()).await?;
+            println!("Listening mode command sent: {}.", command.as_str());
         }
         Command::Battery => print_battery(proxy.battery().await?),
     }
