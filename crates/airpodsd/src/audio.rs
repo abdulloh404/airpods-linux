@@ -4,6 +4,7 @@ use std::time::Duration;
 
 use airpods_audio::{AudioConfig, AudioEngine, PushOutcome};
 use airpods_core::aacp::{AacpSession, ListeningMode};
+use airpods_core::battery::parse_aacp_battery;
 use airpods_core::framing::{demux_audio_sdu, is_audio_sdu};
 use anyhow::{Context, bail};
 use tokio::sync::{Mutex, mpsc, oneshot, watch};
@@ -11,6 +12,7 @@ use tokio::sync::{Mutex, mpsc, oneshot, watch};
 use crate::{
     bluez,
     service::{DesiredAudio, Event, ModeRequest, SharedState},
+    workers::AacpBatteryEvent,
 };
 
 const FIRST_AUDIO_TIMEOUT: Duration = Duration::from_secs(3);
@@ -20,6 +22,8 @@ const QUEUE_FULL_LIMIT: u32 = 256;
 const A2DP_RESET_DELAY: Duration = Duration::from_millis(800);
 const AACP_STOP_SETTLE_DELAY: Duration = Duration::from_millis(200);
 const AACP_CONTROL_SETTLE_DELAY: Duration = Duration::from_millis(100);
+const AACP_NOTIFICATION_RETRY_DELAY: Duration = Duration::from_secs(2);
+const AACP_NOTIFICATION_RETRY_LIMIT: u8 = 2;
 const PACTL_TIMEOUT: Duration = Duration::from_secs(2);
 const A2DP_RESTORE_ATTEMPTS: usize = 3;
 const A2DP_RESTORE_RETRY_DELAY: Duration = Duration::from_millis(100);
@@ -42,6 +46,7 @@ pub async fn lifecycle_loop(
     events: mpsc::UnboundedSender<Event>,
     mut desired: watch::Receiver<DesiredAudio>,
     mut mode_requests: mpsc::Receiver<ModeRequest>,
+    aacp_battery_events: mpsc::UnboundedSender<AacpBatteryEvent>,
     mut shutdown: watch::Receiver<bool>,
 ) {
     let mut reconnect_attempt = 0_u32;
@@ -89,6 +94,7 @@ pub async fn lifecycle_loop(
             &events,
             &mut desired,
             &mut mode_requests,
+            &aacp_battery_events,
             &mut shutdown,
             target,
         )
@@ -140,6 +146,7 @@ async fn stream_once(
     events: &mpsc::UnboundedSender<Event>,
     desired: &mut watch::Receiver<DesiredAudio>,
     mode_requests: &mut mpsc::Receiver<ModeRequest>,
+    aacp_battery_events: &mpsc::UnboundedSender<AacpBatteryEvent>,
     shutdown: &mut watch::Receiver<bool>,
     mut target: DesiredAudio,
 ) -> AttemptExit {
@@ -278,6 +285,10 @@ async fn stream_once(
     let mut decode_errors = 0_u32;
     let mut queue_full = 0_u32;
     let mut watchdog = tokio::time::interval(Duration::from_millis(500));
+    let notification_retry = tokio::time::sleep(AACP_NOTIFICATION_RETRY_DELAY);
+    tokio::pin!(notification_retry);
+    let mut notification_retry_pending = false;
+    let mut notification_retries = 0_u8;
     let outcome = 'stream: loop {
         tokio::select! {
             changed = desired.changed() => {
@@ -320,6 +331,19 @@ async fn stream_once(
                     break AttemptExit::Failed("AirPods microphone stream produced no usable audio for 3 seconds".to_string());
                 }
             }
+            _ = &mut notification_retry, if notification_retry_pending => {
+                notification_retries = notification_retries.saturating_add(1);
+                if let Err(error) = session.request_notifications().await {
+                    eprintln!("failed to retry AACP notifications: {error}");
+                }
+                if notification_retries < AACP_NOTIFICATION_RETRY_LIMIT {
+                    notification_retry
+                        .as_mut()
+                        .reset(tokio::time::Instant::now() + AACP_NOTIFICATION_RETRY_DELAY);
+                } else {
+                    notification_retry_pending = false;
+                }
+            }
             received = session.recv(&mut packet) => {
                 let received = match received {
                     Ok(0) => break AttemptExit::Failed("AirPods disconnected".to_string()),
@@ -327,6 +351,28 @@ async fn stream_once(
                     Err(error) => break AttemptExit::Failed(error.to_string()),
                 };
                 let sdu = &packet[..received];
+                if AacpSession::is_handshake_ack(sdu) {
+                    if let Err(error) = session.set_specific_features().await {
+                        eprintln!("failed to configure AACP battery notifications: {error}");
+                    }
+                    continue;
+                }
+                if AacpSession::is_features_ack(sdu) {
+                    if let Err(error) = session.request_notifications().await {
+                        eprintln!("failed to request AACP battery notifications: {error}");
+                    }
+                    notification_retries = 0;
+                    notification_retry_pending = true;
+                    notification_retry
+                        .as_mut()
+                        .reset(tokio::time::Instant::now() + AACP_NOTIFICATION_RETRY_DELAY);
+                    continue;
+                }
+                if let Some(update) = parse_aacp_battery(sdu) {
+                    let _ = aacp_battery_events.send(AacpBatteryEvent::Update(update));
+                    notification_retry_pending = false;
+                    continue;
+                }
                 if !is_audio_sdu(sdu) {
                     continue;
                 }
@@ -369,6 +415,7 @@ async fn stream_once(
     let _ = cancel_reset.send(());
     let _ = start_reset.await;
     stop_stream(&mut session, &mut engine, &target.address).await;
+    let _ = aacp_battery_events.send(AacpBatteryEvent::SessionEnded);
     set_audio_status(state, events, "stopping", false, 0, None).await;
     outcome
 }

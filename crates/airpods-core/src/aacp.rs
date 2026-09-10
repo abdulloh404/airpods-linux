@@ -17,6 +17,14 @@ const SEND_RETRY_LIMIT: usize = 10;
 const AACP_HANDSHAKE: [u8; 16] = [
     0x00, 0x00, 0x04, 0x00, 0x01, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
 ];
+const AACP_SET_SPECIFIC_FEATURES: [u8; 14] = [
+    0x04, 0x00, 0x04, 0x00, 0x4d, 0x00, 0xd7, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+];
+const AACP_REQUEST_NOTIFICATIONS: [u8; 10] = [
+    0x04, 0x00, 0x04, 0x00, 0x0f, 0x00, 0xff, 0xff, 0xff, 0xff,
+];
+const AACP_HANDSHAKE_ACK_PREFIX: [u8; 4] = [0x01, 0x00, 0x04, 0x00];
+const AACP_FEATURES_ACK_PREFIX: [u8; 6] = [0x04, 0x00, 0x04, 0x00, 0x2b, 0x00];
 const AACP_START_AUDIO: [u8; 19] = [
     0x04, 0x00, 0x04, 0x00, 0x58, 0x00, 0x00, 0x00, 0x09, 0x00, 0x00, 0x01, 0x82, 0x00, 0x00, 0x00,
     0x04, 0x96, 0x00,
@@ -108,6 +116,30 @@ impl AacpSession {
         tokio::time::sleep(Duration::from_millis(100)).await;
         info!("[aacp] session initialized");
         Ok(())
+    }
+
+    /// ระบุว่า packet เป็นการตอบรับ AACP handshake
+    pub fn is_handshake_ack(packet: &[u8]) -> bool {
+        packet.starts_with(&AACP_HANDSHAKE_ACK_PREFIX)
+    }
+
+    /// ระบุว่า packet เป็นการตอบรับการตั้งค่า AACP features
+    pub fn is_features_ack(packet: &[u8]) -> bool {
+        packet.starts_with(&AACP_FEATURES_ACK_PREFIX)
+    }
+
+    /// ส่ง feature setup หลังได้รับ handshake ACK
+    pub async fn set_specific_features(&self) -> Result<()> {
+        self.send(&AACP_SET_SPECIFIC_FEATURES)
+            .await
+            .context("failed to configure AACP notification features")
+    }
+
+    /// ขอให้ AirPods ส่ง AACP notifications รวมถึงค่าแบตเตอรี่
+    pub async fn request_notifications(&self) -> Result<()> {
+        self.send(&AACP_REQUEST_NOTIFICATIONS)
+            .await
+            .context("failed to request AACP notifications")
     }
 
     /// สั่ง AirPods ให้เริ่มส่ง AAC-ELD microphone stream

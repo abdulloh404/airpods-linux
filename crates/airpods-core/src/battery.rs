@@ -1,4 +1,4 @@
-//! อ่านและแปลงสถานะแบตเตอรี่จาก Apple BLE manufacturer data
+//! อ่านและแปลงสถานะแบตเตอรี่จาก Apple BLE manufacturer data และ AACP
 
 use crate::{AirPodsBattery, BatteryLevel};
 use bluer::{Adapter, AdapterEvent, DiscoveryFilter, DiscoveryTransport, Session};
@@ -8,6 +8,17 @@ use tokio::time::timeout;
 
 const APPLE_COMPANY_ID: u16 = 0x004c;
 const SCAN_TIMEOUT: Duration = Duration::from_secs(10);
+const AACP_BATTERY_HEADER: [u8; 6] = [0x04, 0x00, 0x04, 0x00, 0x04, 0x00];
+const AACP_BATTERY_ITEM_SIZE: usize = 5;
+const AACP_MAX_BATTERY_ITEMS: usize = 3;
+
+/// ค่าแบตเตอรี่เฉพาะ component ที่มากับ AACP notification หนึ่ง packet
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct AacpBatteryUpdate {
+    pub left: Option<BatteryLevel>,
+    pub right: Option<BatteryLevel>,
+    pub case: Option<BatteryLevel>,
+}
 
 /// สแกน BLE ชั่วคราวจนพบ AirPods advertisement ที่แปลงได้
 pub async fn scan_airpods_battery() -> Result<AirPodsBattery, String> {
@@ -118,6 +129,53 @@ pub fn parse_advertisement(
     })
 }
 
+/// แปลง AACP battery notification เป็นค่า 0–100 โดยไม่ลดความละเอียด
+pub fn parse_aacp_battery(data: &[u8]) -> Option<AacpBatteryUpdate> {
+    if data.len() < 7 || !data.starts_with(&AACP_BATTERY_HEADER) {
+        return None;
+    }
+
+    let item_count = usize::from(data[6]);
+    if item_count == 0
+        || item_count > AACP_MAX_BATTERY_ITEMS
+        || data.len() != 7 + item_count * AACP_BATTERY_ITEM_SIZE
+    {
+        return None;
+    }
+
+    let mut update = AacpBatteryUpdate::default();
+    for item in data[7..].chunks_exact(AACP_BATTERY_ITEM_SIZE) {
+        if item[1] != 0x01 || item[4] != 0x01 {
+            return None;
+        }
+
+        let level = match item[3] {
+            0x01 => BatteryLevel {
+                percent: Some(valid_percent(item[2])?),
+                charging: true,
+            },
+            0x02 => BatteryLevel {
+                percent: Some(valid_percent(item[2])?),
+                charging: false,
+            },
+            0x04 => BatteryLevel {
+                percent: None,
+                charging: false,
+            },
+            _ => return None,
+        };
+
+        match item[0] {
+            0x02 => update.right = Some(level),
+            0x04 => update.left = Some(level),
+            0x08 => update.case = Some(level),
+            _ => {}
+        }
+    }
+
+    (update.left.is_some() || update.right.is_some() || update.case.is_some()).then_some(update)
+}
+
 /// คืนชื่อรุ่นที่ตรงกับ model id ใน advertisement
 pub fn model_name(model_id: u16) -> &'static str {
     match model_id {
@@ -158,4 +216,8 @@ fn battery_percent(nibble: u8) -> Option<u8> {
         0x00..=0x0a => Some(nibble * 10),
         _ => None,
     }
+}
+
+fn valid_percent(percent: u8) -> Option<u8> {
+    (percent <= 100).then_some(percent)
 }

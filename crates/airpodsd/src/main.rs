@@ -35,6 +35,8 @@ async fn main() -> Result<()> {
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let (event_tx, event_rx) = mpsc::unbounded_channel();
     let (mode_tx, mode_rx) = mpsc::channel(8);
+    let (aacp_battery_tx, aacp_battery_rx) = mpsc::unbounded_channel();
+    let (device_connected_tx, device_connected_rx) = watch::channel(None);
 
     let service = ManagerService::new(
         state.clone(),
@@ -56,17 +58,21 @@ async fn main() -> Result<()> {
         event_tx.clone(),
         desired_rx,
         mode_rx,
+        aacp_battery_tx,
         shutdown_rx.clone(),
     ));
     let inventory_task = tokio::spawn(workers::inventory_loop(
         state.clone(),
         event_tx.clone(),
+        device_connected_tx,
         shutdown_rx.clone(),
     ));
     let battery_task = tokio::spawn(workers::battery_loop(
         state,
         event_tx,
         power::PowerBridge::default(),
+        aacp_battery_rx,
+        device_connected_rx,
         shutdown_rx,
     ));
 
