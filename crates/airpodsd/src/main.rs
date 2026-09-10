@@ -5,6 +5,7 @@ mod bluez;
 mod config;
 mod power;
 mod service;
+mod sound;
 mod workers;
 
 use std::path::Path;
@@ -14,7 +15,7 @@ use anyhow::Result;
 use service::{DesiredAudio, Event, ManagerService, RuntimeState};
 use tokio::sync::{RwLock, mpsc, watch};
 
-use airpods_ipc::{BUS_NAME, MANAGER_INTERFACE, OBJECT_PATH};
+use airpods_ipc::{BUS_NAME, MANAGER_INTERFACE, OBJECT_PATH, SoundMode};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -31,6 +32,7 @@ async fn main() -> Result<()> {
         Path::new("/dev/airpods_power").exists(),
         config_error,
     )));
+    let initial_sound_mode = SoundMode::parse(&config.sound_mode).unwrap_or(SoundMode::Off);
     let (desired_tx, desired_rx) = watch::channel(DesiredAudio::from_config(&config));
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let (event_tx, event_rx) = mpsc::unbounded_channel();
@@ -51,6 +53,10 @@ async fn main() -> Result<()> {
         .serve_at(OBJECT_PATH, service)?
         .build()
         .await?;
+
+    if let Err(error) = sound::publish_mode(initial_sound_mode).await {
+        state.write().await.status.sound_error = error.to_string();
+    }
 
     let event_task = tokio::spawn(emit_events(connection.clone(), event_rx));
     let audio_task = tokio::spawn(audio::lifecycle_loop(

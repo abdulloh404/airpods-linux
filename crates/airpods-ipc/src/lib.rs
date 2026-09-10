@@ -19,6 +19,38 @@ pub const MIN_LIMITER_DB: f64 = -12.0;
 pub const MAX_LIMITER_DB: f64 = 0.0;
 pub const DEFAULT_LIMITER_DB: f64 = -3.0;
 
+/// โหมด DSP สำหรับเสียง output ที่ส่งเข้า AirPods A2DP sink เดิม
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SoundMode {
+    Off,
+    Wide,
+    Fix,
+    Spatial,
+}
+
+impl SoundMode {
+    /// แปลงชื่อ mode จาก CLI, config และ D-Bus ให้เป็นค่าเดียวกัน
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "off" => Some(Self::Off),
+            "wide" => Some(Self::Wide),
+            "fix" | "fixed" => Some(Self::Fix),
+            "spatial" => Some(Self::Spatial),
+            _ => None,
+        }
+    }
+
+    /// คืนชื่อ canonical ที่ใช้เก็บใน config และ PipeWire metadata
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Wide => "wide",
+            Self::Fix => "fix",
+            Self::Spatial => "spatial",
+        }
+    }
+}
+
 /// สถานะล่าสุดของ daemon และ virtual microphone
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Type)]
 pub struct DaemonStatus {
@@ -30,6 +62,8 @@ pub struct DaemonStatus {
     pub limiter_db: f64,
     pub power_bridge_available: bool,
     pub last_error: String,
+    pub sound_mode: String,
+    pub sound_error: String,
 }
 
 /// ข้อมูล AirPods ที่ daemon ค้นพบจาก BlueZ
@@ -86,6 +120,8 @@ pub trait Manager {
     fn set_limiter_db(&self, limiter_db: f64) -> zbus::Result<()>;
 
     fn set_listening_mode(&self, mode: &str) -> zbus::Result<()>;
+
+    fn set_sound_mode(&self, mode: &str) -> zbus::Result<()>;
 
     fn battery(&self) -> zbus::Result<BatteryStatus>;
 

@@ -33,6 +33,11 @@ enum Command {
         #[command(subcommand)]
         command: ModeCommand,
     },
+    /// Control stereo and spatial processing on the existing AirPods output.
+    Sound {
+        #[command(subcommand)]
+        command: SoundCommand,
+    },
     /// Show left and right battery values.
     Battery,
 }
@@ -58,6 +63,44 @@ impl ModeCommand {
             Self::Adaptive => "adaptive",
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, Subcommand)]
+enum SoundModeCommand {
+    /// Preserve the original PipeWire stereo signal.
+    Off,
+    /// Widen the stereo image without head tracking.
+    Wide,
+    /// Keep a stationary binaural sound stage.
+    #[command(alias = "fixed")]
+    Fix,
+    /// Use the binaural graph and accept head-pose updates.
+    Spatial,
+}
+
+impl SoundModeCommand {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Wide => "wide",
+            Self::Fix => "fix",
+            Self::Spatial => "spatial",
+        }
+    }
+}
+
+#[derive(Debug, Subcommand)]
+enum SoundCommand {
+    /// Select one output processing mode.
+    #[command(
+        after_help = "Suggestions:\n  off      Original stereo and lowest processing\n  wide     Wider music playback without head tracking\n  fix      Stationary binaural sound stage\n  spatial  Binaural sound stage with head-pose control"
+    )]
+    Mode {
+        #[command(subcommand)]
+        mode: SoundModeCommand,
+    },
+    /// Show the requested output processing mode.
+    Status,
 }
 
 #[derive(Debug, Subcommand)]
@@ -142,6 +185,13 @@ async fn main() -> Result<()> {
             proxy.set_listening_mode(command.as_str()).await?;
             println!("Listening mode command sent: {}.", command.as_str());
         }
+        Command::Sound { command } => match command {
+            SoundCommand::Mode { mode } => {
+                proxy.set_sound_mode(mode.as_str()).await?;
+                println!("Sound mode set to {}.", mode.as_str());
+            }
+            SoundCommand::Status => print_sound_status(&proxy.status().await?),
+        },
         Command::Battery => print_battery(proxy.battery().await?),
     }
     Ok(())
@@ -160,6 +210,7 @@ fn print_status(status: &DaemonStatus) {
     println!("Microphone: {}", on_off(status.mic_active));
     println!("Gain: {:.1} dB", status.gain_db);
     println!("Limiter: {:.1} dBFS", status.limiter_db);
+    println!("Sound mode: {}", status.sound_mode);
     println!(
         "UPower bridge: {}",
         if status.power_bridge_available {
@@ -170,6 +221,16 @@ fn print_status(status: &DaemonStatus) {
     );
     if !status.last_error.is_empty() {
         println!("Last error: {}", status.last_error);
+    }
+    if !status.sound_error.is_empty() {
+        println!("Sound error: {}", status.sound_error);
+    }
+}
+
+fn print_sound_status(status: &DaemonStatus) {
+    println!("Sound mode: {}", status.sound_mode);
+    if !status.sound_error.is_empty() {
+        println!("Last error: {}", status.sound_error);
     }
 }
 

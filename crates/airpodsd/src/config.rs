@@ -7,6 +7,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use airpods_ipc::{
     DEFAULT_GAIN_DB, DEFAULT_LIMITER_DB, MAX_GAIN_DB, MAX_LIMITER_DB, MIN_GAIN_DB, MIN_LIMITER_DB,
+    SoundMode,
 };
 use serde::{Deserialize, Serialize};
 
@@ -17,6 +18,7 @@ pub struct Config {
     pub mic_enabled: bool,
     pub gain_db: f64,
     pub limiter_db: f64,
+    pub sound_mode: String,
 }
 
 impl Default for Config {
@@ -26,6 +28,7 @@ impl Default for Config {
             mic_enabled: false,
             gain_db: DEFAULT_GAIN_DB,
             limiter_db: DEFAULT_LIMITER_DB,
+            sound_mode: SoundMode::Off.as_str().to_string(),
         }
     }
 }
@@ -92,6 +95,9 @@ impl Config {
             || !(MIN_LIMITER_DB..=MAX_LIMITER_DB).contains(&self.limiter_db)
         {
             anyhow::bail!("configured limiter is outside the supported range");
+        }
+        if SoundMode::parse(&self.sound_mode).is_none() {
+            anyhow::bail!("configured sound mode must be one of: off, wide, fix, spatial");
         }
         Ok(())
     }

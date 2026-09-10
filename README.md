@@ -13,6 +13,8 @@ control it over the session D-Bus.
 - `airpods-audio` — C++20 AAC-ELD/DSP/PipeWire engine with a Rust facade.
 - `airpods-power` — optional Linux `power_supply` bridge for separate Left and
   Right batteries in UPower.
+- `airpods-dsp.lua` — WirePlumber policy that inserts stereo/HRTF processing
+  inside the existing AirPods A2DP sink without creating another output.
 
 ## Build
 
@@ -41,6 +43,22 @@ airpodsctl mode anc
 airpodsctl mode transparency
 airpodsctl mode adaptive
 ```
+
+Set output processing without selecting a separate PipeWire profile or sink:
+
+```bash
+airpodsctl sound mode off
+airpodsctl sound mode wide
+airpodsctl sound mode fix
+airpodsctl sound mode spatial
+airpodsctl sound status
+```
+
+`off` preserves the original stereo signal, `wide` applies normalized mid/side
+widening, and `fix` renders a stationary binaural stage with the system SOFA
+HRTF dataset. `spatial` uses the same graph and accepts `sound.yaw` and
+`sound.pitch` metadata updates; automatic AirPods sensor forwarding is the next
+integration step.
 
 The kernel battery bridge is optional for audio operation. Without it, exact
 Left and Right values remain available through `airpodsctl` and `airpods-gui`,

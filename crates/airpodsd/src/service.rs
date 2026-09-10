@@ -5,7 +5,7 @@ use std::sync::Arc;
 use airpods_core::aacp::ListeningMode;
 use airpods_ipc::{
     BatteryStatus, DaemonStatus, DeviceInfo, MAX_GAIN_DB, MAX_LIMITER_DB, MIN_GAIN_DB,
-    MIN_LIMITER_DB,
+    MIN_LIMITER_DB, SoundMode,
 };
 use tokio::sync::{Mutex, RwLock, mpsc, oneshot, watch};
 
@@ -83,6 +83,11 @@ impl RuntimeState {
                 limiter_db: config.limiter_db,
                 power_bridge_available,
                 last_error: config_error,
+                sound_mode: SoundMode::parse(&config.sound_mode)
+                    .unwrap_or(SoundMode::Off)
+                    .as_str()
+                    .to_string(),
+                sound_error: String::new(),
             },
             devices: Vec::new(),
             battery: BatteryStatus::unavailable(),
@@ -265,6 +270,34 @@ impl ManagerService {
                 zbus::fdo::Error::Failed("AACP lifecycle worker stopped responding".to_string())
             })?
             .map_err(zbus::fdo::Error::Failed)
+    }
+
+    async fn set_sound_mode(&self, mode: &str) -> zbus::fdo::Result<()> {
+        let mode = SoundMode::parse(mode).ok_or_else(|| {
+            zbus::fdo::Error::InvalidArgs(
+                "sound mode must be one of: off, wide, fix, spatial".to_string(),
+            )
+        })?;
+        crate::sound::publish_mode(mode)
+            .await
+            .map_err(|error| zbus::fdo::Error::Failed(error.to_string()))?;
+
+        {
+            let mut config = self.config.lock().await;
+            let mut next = config.clone();
+            next.sound_mode = mode.as_str().to_string();
+            self.config_store
+                .save(&next)
+                .map_err(|error| zbus::fdo::Error::Failed(error.to_string()))?;
+            *config = next;
+        }
+        {
+            let mut state = self.state.write().await;
+            state.status.sound_mode = mode.as_str().to_string();
+            state.status.sound_error.clear();
+        }
+        self.publish_status().await;
+        Ok(())
     }
 
     async fn battery(&self) -> BatteryStatus {
