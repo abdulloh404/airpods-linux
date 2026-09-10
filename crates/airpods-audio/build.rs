@@ -18,10 +18,12 @@ fn main() {
         .define("FDK_AAC_INSTALL_PKGCONFIG_MODULE", "OFF")
         .build();
     let mut pipewire_config = pkg_config::Config::new();
-    pipewire_config.atleast_version("0.3").cargo_metadata(false);
+    pipewire_config
+        .atleast_version("1.6.8")
+        .cargo_metadata(false);
     let pipewire = pipewire_config
         .probe("libpipewire-0.3")
-        .expect("PipeWire development files are required (Ubuntu: libpipewire-0.3-dev)");
+        .expect("PipeWire 1.6.8 or newer development files are required");
 
     let mut native = cc::Build::new();
     native

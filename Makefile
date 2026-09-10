@@ -5,6 +5,8 @@ UDEV_RULES_DIR := /etc/udev/rules.d
 MODULES_LOAD_DIR := /etc/modules-load.d
 KERNEL_RELEASE := $(shell uname -r)
 KERNEL_MODULE_DIR := /lib/modules/$(KERNEL_RELEASE)/extra
+PIPEWIRE_PREFIX ?= /opt/pipewire-1.6.8
+PIPEWIRE_PKG_CONFIG_PATH := $(PIPEWIRE_PREFIX)/lib/pkgconfig
 
 DAEMON_BINARY := target/debug/airpodsd
 CLI_BINARY := target/debug/airpodsctl
@@ -21,7 +23,7 @@ AIRPODS_USER_RUNTIME_DIR := /run/user/$(AIRPODS_USER_ID)
 all: build
 
 build:
-	cargo build --workspace
+	PKG_CONFIG_PATH="$(PIPEWIRE_PKG_CONFIG_PATH)$(if $(PKG_CONFIG_PATH),:$(PKG_CONFIG_PATH))" cargo build --workspace
 	$(MAKE) -C kernel/airpods-power
 
 check-root:
