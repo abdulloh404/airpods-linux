@@ -7,6 +7,9 @@ Wants=pipewire.service wireplumber.service
 [Service]
 Type=dbus
 BusName=io.github.abdulloh404.AirPods
+Environment="LD_LIBRARY_PATH=/opt/pipewire-1.6.8/lib"
+Environment="PIPEWIRE_MODULE_DIR=/opt/pipewire-1.6.8/lib/pipewire-0.3"
+Environment="SPA_PLUGIN_DIR=/opt/pipewire-1.6.8/lib/spa-0.2"
 ExecStart=/usr/local/bin/airpodsd
 Restart=on-failure
 RestartSec=2s
