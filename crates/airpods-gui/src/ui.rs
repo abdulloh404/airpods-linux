@@ -1,4 +1,7 @@
 //! สร้างหน้าต่างควบคุม AirPods และแสดง state ที่ได้รับจาก `airpodsd`
+//!
+//! Module นี้ประกอบ widget แต่ละ section ผูก callback ให้ส่ง `Command` และนำ `Event`
+//! มาอัปเดตหน้าจอ โดยใช้ flag `updating` ป้องกัน callback จากการเปลี่ยน widget ด้วย code
 
 use std::cell::Cell;
 use std::rc::Rc;
@@ -16,29 +19,48 @@ use gtk::{Align, Orientation};
 use crate::ipc_client::{Client, Command, Event};
 
 #[derive(Clone)]
+/// รวม widget ที่ต้องเปลี่ยนตาม event จาก daemon เพื่อส่งต่อเป็น state ชุดเดียว
 struct View {
+    /// badge ที่แสดง state ของ daemon
     daemon_badge: gtk::Label,
+    /// รายการอุปกรณ์ที่ให้ผู้ใช้เลือก
     device_combo: gtk::ComboBoxText,
+    /// ข้อความสถานะการเชื่อมต่อของอุปกรณ์ที่เลือก
     device_state: gtk::Label,
+    /// กล่องคำแนะนำที่แสดงเมื่อ BlueZ ไม่พบ AirPods
     empty_state: gtk::Box,
+    /// card ของ virtual microphone ที่เปิดใช้งานเมื่อเลือกอุปกรณ์แล้ว
     microphone_controls: gtk::Box,
+    /// switch สำหรับเริ่มหรือหยุด virtual microphone
     mic_switch: gtk::Switch,
+    /// ตัวควบคุม gain ก่อน limiter
     gain_spin: gtk::SpinButton,
+    /// ตัวควบคุม limiter ceiling
     limiter_spin: gtk::SpinButton,
+    /// widget แบตเตอรี่ของ AirPod ข้างซ้าย
     left: BatteryView,
+    /// widget แบตเตอรี่ของ AirPod ข้างขวา
     right: BatteryView,
+    /// badge ที่แสดงความพร้อมของ UPower bridge
     power_bridge: gtk::Label,
+    /// container ที่ซ่อนหรือเปิด error banner ด้วย transition
     error_revealer: gtk::Revealer,
+    /// ข้อความ error ล่าสุดที่แสดงแก่ผู้ใช้
     error_label: gtk::Label,
+    /// guard ร่วมสำหรับแยกการอัปเดตจาก daemon ออกจาก input ของผู้ใช้
     updating: Rc<Cell<bool>>,
 }
 
 #[derive(Clone)]
+/// widget คู่ที่แสดงค่าแบตเตอรี่หนึ่งข้างทั้งตัวเลขและแถบระดับ
 struct BatteryView {
+    /// ข้อความร้อยละและเครื่องหมายชาร์จ
     value: gtk::Label,
+    /// แถบระดับที่รับค่า normalized ช่วงศูนย์ถึงหนึ่ง
     bar: gtk::ProgressBar,
 }
 
+/// สร้างหน้าต่างหลัก เชื่อม event receiver และแสดง application แก่ผู้ใช้
 pub fn build(app: &gtk::Application) {
     let (client, events) = Client::start();
 
@@ -62,6 +84,7 @@ pub fn build(app: &gtk::Application) {
     window.present();
 }
 
+/// สร้าง titlebar และผูกปุ่ม Refresh ให้ขอ snapshot ใหม่จาก worker
 fn build_titlebar(client: &Client) -> gtk::HeaderBar {
     let header = gtk::HeaderBar::new();
     header.set_show_title_buttons(true);
@@ -79,6 +102,7 @@ fn build_titlebar(client: &Client) -> gtk::HeaderBar {
     header
 }
 
+/// ประกอบ section ทั้งหมดและคืน widget ที่ event handler ต้องอัปเดต
 fn build_content(client: &Client) -> (gtk::Box, View) {
     let root = gtk::Box::new(Orientation::Vertical, 28);
     root.set_css_classes(&["app-shell"]);
@@ -100,6 +124,7 @@ fn build_content(client: &Client) -> (gtk::Box, View) {
     let (airpods, device_combo, device_state, empty_state, daemon_badge) = build_airpods_section();
     root.append(&airpods);
 
+    // callback ทุกตัวใช้ guard เดียวกันเพื่อไม่ส่งคำสั่งย้อนกลับตอน render state ใหม่
     let updating = Rc::new(Cell::new(false));
     let (microphone, microphone_controls, mic_switch, gain_spin, limiter_spin) =
         build_microphone_section(client, &updating);
@@ -131,6 +156,7 @@ fn build_content(client: &Client) -> (gtk::Box, View) {
     )
 }
 
+/// สร้างส่วนเลือก AirPods พร้อม connection state, daemon badge และ empty state
 fn build_airpods_section() -> (
     gtk::Box,
     gtk::ComboBoxText,
@@ -186,6 +212,7 @@ fn build_airpods_section() -> (
     (section, combo, state, empty, daemon_badge)
 }
 
+/// สร้างส่วนควบคุม virtual microphone และผูก input ของผู้ใช้เข้ากับ D-Bus worker
 fn build_microphone_section(
     client: &Client,
     updating: &Rc<Cell<bool>>,
@@ -204,6 +231,7 @@ fn build_microphone_section(
     let command_client = client.clone();
     let changing = updating.clone();
     mic_switch.connect_active_notify(move |control| {
+        // การ set switch จาก status event ต้องไม่กลายเป็นคำสั่ง start หรือ stop รอบใหม่
         if changing.get() {
             return;
         }
@@ -224,6 +252,7 @@ fn build_microphone_section(
     let command_client = client.clone();
     let changing = updating.clone();
     gain_spin.connect_value_changed(move |control| {
+        // ส่งเฉพาะค่าที่ผู้ใช้เปลี่ยน เพื่อไม่สร้าง signal loop ระหว่าง GUI กับ daemon
         if !changing.get() {
             command_client.send(Command::SetGain(control.value()));
         }
@@ -239,6 +268,7 @@ fn build_microphone_section(
     let command_client = client.clone();
     let changing = updating.clone();
     limiter_spin.connect_value_changed(move |control| {
+        // ใช้ guard เดียวกับ gain เพราะ status event อัปเดต spin ทั้งสองพร้อมกัน
         if !changing.get() {
             command_client.send(Command::SetLimiter(control.value()));
         }
@@ -248,11 +278,13 @@ fn build_microphone_section(
         "Maximum output level, measured in dBFS.",
         &limiter_spin,
     ));
+    // ยังไม่ให้เริ่ม microphone หรือปรับ DSP จนกว่า status จะระบุอุปกรณ์ที่เลือก
     card.set_sensitive(false);
 
     (section, card, mic_switch, gain_spin, limiter_spin)
 }
 
+/// สร้างส่วนแบตเตอรี่สองข้างและ badge ของ UPower bridge
 fn build_battery_section() -> (gtk::Box, BatteryView, BatteryView, gtk::Label) {
     let (section, card) = settings_section("Battery");
 
@@ -283,6 +315,7 @@ fn build_battery_section() -> (gtk::Box, BatteryView, BatteryView, gtk::Label) {
     (section, left, right, power_bridge)
 }
 
+/// สร้างโครง section มาตรฐานที่มีหัวข้อและ card สำหรับวาง setting row
 fn settings_section(title: &str) -> (gtk::Box, gtk::Box) {
     let section = gtk::Box::new(Orientation::Vertical, 10);
     section.set_css_classes(&["settings-section"]);
@@ -298,6 +331,7 @@ fn settings_section(title: &str) -> (gtk::Box, gtk::Box) {
     (section, card)
 }
 
+/// จัดข้อความอธิบายและ widget ควบคุมให้อยู่ในแถวรูปแบบเดียวกัน
 fn setting_row(title: &str, description: &str, control: &impl IsA<gtk::Widget>) -> gtk::Box {
     let row = gtk::Box::new(Orientation::Horizontal, 18);
     row.set_css_classes(&["settings-row"]);
@@ -323,12 +357,14 @@ fn setting_row(title: &str, description: &str, control: &impl IsA<gtk::Widget>) 
     row
 }
 
+/// สร้างเส้นคั่นที่ใช้ style ร่วมกันภายใน settings card
 fn settings_separator() -> gtk::Separator {
     let separator = gtk::Separator::new(Orientation::Horizontal);
     separator.set_css_classes(&["settings-separator"]);
     separator
 }
 
+/// สร้างตัวควบคุมตัวเลขที่จำกัดช่วงและ snap ตาม step ของ audio setting
 fn numeric_control(minimum: f64, maximum: f64, step: f64) -> gtk::SpinButton {
     let control = gtk::SpinButton::with_range(minimum, maximum, step);
     control.set_digits(0);
@@ -338,6 +374,7 @@ fn numeric_control(minimum: f64, maximum: f64, step: f64) -> gtk::SpinButton {
     control
 }
 
+/// สร้าง widget แบตเตอรี่หนึ่งข้างและคืน handle สำหรับอัปเดตค่าภายหลัง
 fn battery_control() -> (gtk::Box, BatteryView) {
     let control = gtk::Box::new(Orientation::Vertical, 5);
     control.set_css_classes(&["battery-control"]);
@@ -354,10 +391,12 @@ fn battery_control() -> (gtk::Box, BatteryView) {
     (control, BatteryView { value, bar })
 }
 
+/// ส่ง address ที่ผู้ใช้เลือกไปยัง worker โดยไม่ตอบสนองต่อการ render snapshot
 fn connect_device_selection(combo: &gtk::ComboBoxText, client: &Client, updating: &Rc<Cell<bool>>) {
     let client = client.clone();
     let updating = updating.clone();
     combo.connect_changed(move |combo| {
+        // การเติมรายการและเลือกค่าเดิมจาก daemon จะเรียก signal นี้เช่นเดียวกับ input จริง
         if updating.get() {
             return;
         }
@@ -367,8 +406,10 @@ fn connect_device_selection(combo: &gtk::ComboBoxText, client: &Client, updating
     });
 }
 
+/// ตรวจ event channel เป็นช่วงสั้นบน GTK main loop แล้วอัปเดต widget ตามชนิด event
 fn attach_event_receiver(view: View, events: mpsc::Receiver<Event>) {
     glib::timeout_add_local(Duration::from_millis(80), move || {
+        // ระบาย event ที่รออยู่ทั้งหมดในรอบเดียวเพื่อลดความล่าช้าเมื่อ signal เข้ามาติดกัน
         while let Ok(event) = events.try_recv() {
             match event {
                 Event::Snapshot {
@@ -387,6 +428,7 @@ fn attach_event_receiver(view: View, events: mpsc::Receiver<Event>) {
                     update_battery(&view.right, battery.right_percent, battery.right_charging);
                 }
                 Event::Devices(devices) => {
+                    // รักษาค่าที่ combo เลือกไว้ หาก signal ชุดใหม่ยังมี address เดิม
                     let selected = view
                         .device_combo
                         .active_id()
@@ -395,6 +437,7 @@ fn attach_event_receiver(view: View, events: mpsc::Receiver<Event>) {
                     update_devices(&view, &devices, &selected);
                 }
                 Event::Error(message) => {
+                    // error จาก worker หมายถึงสถานะ daemon ยังไม่น่าเชื่อถือจนกว่าจะ reconnect
                     set_state_badge(&view.daemon_badge, "UNAVAILABLE", "state-error");
                     show_error(&view, &message);
                 }
@@ -404,7 +447,9 @@ fn attach_event_receiver(view: View, events: mpsc::Receiver<Event>) {
     });
 }
 
+/// สร้างรายการอุปกรณ์ใหม่และเลือก address ที่ยังใช้ได้ตามลำดับความสำคัญ
 fn update_devices(view: &View, devices: &[DeviceInfo], selected_address: &str) {
+    // ปิด callback ชั่วคราว เพราะ remove, append และ set active ต่างส่ง changed signal ได้
     view.updating.set(true);
     view.device_combo.remove_all();
     for device in devices {
@@ -419,6 +464,7 @@ fn update_devices(view: &View, devices: &[DeviceInfo], selected_address: &str) {
         );
     }
 
+    // ใช้ address จาก snapshot ก่อน แล้ว fallback ไปยังรายการที่ daemon ทำเครื่องหมาย selected
     let selected_address = devices
         .iter()
         .find(|device| device.address == selected_address)
@@ -429,6 +475,7 @@ fn update_devices(view: &View, devices: &[DeviceInfo], selected_address: &str) {
     }
     view.updating.set(false);
 
+    // empty state แทน combo ทั้งชุดเพื่อบอกวิธีแก้เมื่อ BlueZ ยังไม่พบอุปกรณ์
     let is_empty = devices.is_empty();
     view.empty_state.set_visible(is_empty);
     view.device_combo.set_visible(!is_empty);
@@ -444,6 +491,7 @@ fn update_devices(view: &View, devices: &[DeviceInfo], selected_address: &str) {
     });
 }
 
+/// แปลง daemon status เป็น badge, sensitivity, audio controls และ error banner
 fn update_status(view: &View, status: &DaemonStatus) {
     let normalized_state = status.state.to_ascii_lowercase();
     let state_class = match normalized_state.as_str() {
@@ -457,9 +505,11 @@ fn update_status(view: &View, status: &DaemonStatus) {
         state_class,
     );
 
+    // daemon ต้องมีอุปกรณ์เป้าหมายก่อนจึงยอมให้ควบคุม microphone และ DSP
     let has_device = !status.selected_device.is_empty();
     view.microphone_controls.set_sensitive(has_device);
 
+    // guard ป้องกัน setter เหล่านี้ส่ง Command กลับไปยัง daemon ซ้ำ
     view.updating.set(true);
     view.mic_switch.set_active(status.mic_active);
     view.gain_spin.set_value(status.gain_db);
@@ -479,7 +529,9 @@ fn update_status(view: &View, status: &DaemonStatus) {
     }
 }
 
+/// แสดงค่าแบตเตอรี่ที่ valid หรือคืน widget สู่สถานะไม่มีข้อมูล
 fn update_battery(view: &BatteryView, percent: i16, charging: bool) {
+    // D-Bus contract ใช้ค่าติดลบแทนค่าแบตเตอรี่ที่ยังไม่พร้อม
     if percent < 0 {
         view.value.set_text("—");
         view.bar.set_fraction(0.0);
@@ -487,6 +539,7 @@ fn update_battery(view: &BatteryView, percent: i16, charging: bool) {
         return;
     }
 
+    // จำกัดค่าก่อนส่งให้ ProgressBar เพื่อป้องกันข้อมูลผิดช่วงกระทบการแสดงผล
     let percent = percent.clamp(0, 100);
     let charging_mark = if charging { "⚡ " } else { "" };
     view.value.set_text(&format!("{charging_mark}{percent}%"));
@@ -496,6 +549,7 @@ fn update_battery(view: &BatteryView, percent: i16, charging: bool) {
         .set_tooltip_text(Some(&format!("Battery level: {percent}%{charging_state}")));
 }
 
+/// เปลี่ยนข้อความและแทนที่สีสถานะเดิมของ badge ด้วย class ใหม่เพียงค่าเดียว
 fn set_state_badge(label: &gtk::Label, text: &str, class: &str) {
     label.set_text(text);
     label.remove_css_class("state-ok");
@@ -504,11 +558,13 @@ fn set_state_badge(label: &gtk::Label, text: &str, class: &str) {
     label.add_css_class(class);
 }
 
+/// ใส่ข้อความ error ล่าสุดและเปิด banner ด้วย revealer
 fn show_error(view: &View, message: &str) {
     view.error_label.set_text(message);
     view.error_revealer.set_reveal_child(true);
 }
 
+/// ซ่อน error banner เมื่อ snapshot ล่าสุดไม่มี error
 fn clear_error(view: &View) {
     view.error_revealer.set_reveal_child(false);
 }

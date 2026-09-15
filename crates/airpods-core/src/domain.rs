@@ -36,6 +36,7 @@ pub struct MicSettings {
 }
 
 impl Default for MicSettings {
+    /// คืนค่า DSP เริ่มต้นที่เพิ่มระดับ microphone ก่อนจำกัด peak
     fn default() -> Self {
         Self {
             gain_db: 18.0,

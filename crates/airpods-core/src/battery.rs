@@ -1,4 +1,7 @@
 //! อ่านและแปลงสถานะแบตเตอรี่จาก Apple BLE manufacturer data และ AACP
+//!
+//! BLE path ใช้ตอนต้องค้นหาค่าจาก advertisement ส่วน AACP path แปลง notification
+//! ที่มากับ session โดยตรวจโครงสร้าง packet ทั้งก้อนก่อนคืนค่าราย component
 
 use crate::{AirPodsBattery, BatteryLevel};
 use bluer::{Adapter, AdapterEvent, DiscoveryFilter, DiscoveryTransport, Session};
@@ -6,17 +9,25 @@ use futures_util::{StreamExt, pin_mut};
 use std::time::Duration;
 use tokio::time::timeout;
 
+/// Apple company identifier ที่ครอบ manufacturer data ใน BLE advertisement
 const APPLE_COMPANY_ID: u16 = 0x004c;
+/// เวลาสูงสุดที่รอ advertisement ที่รู้จักหนึ่งรายการ
 const SCAN_TIMEOUT: Duration = Duration::from_secs(10);
+/// header ของ AACP battery notification
 const AACP_BATTERY_HEADER: [u8; 6] = [0x04, 0x00, 0x04, 0x00, 0x04, 0x00];
+/// ขนาด record ของ battery component หนึ่งรายการ
 const AACP_BATTERY_ITEM_SIZE: usize = 5;
+/// จำนวน component สูงสุดคือหูฟังซ้าย ขวา และเคส
 const AACP_MAX_BATTERY_ITEMS: usize = 3;
 
 /// ค่าแบตเตอรี่เฉพาะ component ที่มากับ AACP notification หนึ่ง packet
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct AacpBatteryUpdate {
+    /// ค่าใหม่ของหูฟังซ้าย หรือ `None` เมื่อ packet ไม่มี component นี้
     pub left: Option<BatteryLevel>,
+    /// ค่าใหม่ของหูฟังขวา หรือ `None` เมื่อ packet ไม่มี component นี้
     pub right: Option<BatteryLevel>,
+    /// ค่าใหม่ของเคส หรือ `None` เมื่อ packet ไม่มี component นี้
     pub case: Option<BatteryLevel>,
 }
 
@@ -40,10 +51,12 @@ pub async fn scan_airpods_battery() -> Result<AirPodsBattery, String> {
         .map_err(|error| format!("failed to configure BLE scan: {error}"))?;
 
     let result = scan_once(&adapter).await;
+    // คืน discovery filter เดิมแบบ best-effort เพื่อไม่รบกวนผู้ใช้รายอื่นของ adapter
     let _ = adapter.set_discovery_filter(previous_filter).await;
     result
 }
 
+/// อ่าน event จาก BLE discovery stream จนพบ manufacturer data ของ AirPods ที่รองรับ
 async fn scan_once(adapter: &Adapter) -> Result<AirPodsBattery, String> {
     let events = adapter
         .discover_devices_with_changes()
@@ -96,6 +109,7 @@ pub fn parse_advertisement(
         return None;
     }
 
+    // Apple สลับตำแหน่ง nibble ซ้ายและขวาตาม flag นี้ จึงต้องใช้ flag เดียวกันกับ charging bit
     let values_flipped = data[5] & 0x20 == 0;
     let pods = data[6];
     let left_nibble = if values_flipped {
@@ -136,6 +150,7 @@ pub fn parse_aacp_battery(data: &[u8]) -> Option<AacpBatteryUpdate> {
     }
 
     let item_count = usize::from(data[6]);
+    // บังคับขนาด packet ให้ตรงกับจำนวน record เพื่อไม่ยอมรับข้อมูลตัดขาดหรือส่วนเกิน
     if item_count == 0
         || item_count > AACP_MAX_BATTERY_ITEMS
         || data.len() != 7 + item_count * AACP_BATTERY_ITEM_SIZE
@@ -149,6 +164,7 @@ pub fn parse_aacp_battery(data: &[u8]) -> Option<AacpBatteryUpdate> {
             return None;
         }
 
+        // byte สถานะแยก charging, discharging และ unavailable ออกจากเปอร์เซ็นต์
         let level = match item[3] {
             0x01 => BatteryLevel {
                 percent: Some(valid_percent(item[2])?),
@@ -194,6 +210,7 @@ pub fn model_name(model_id: u16) -> &'static str {
     }
 }
 
+/// ระบุ model id ที่ parser รู้จัก เพื่อกัน Apple advertisement ชนิดอื่น
 fn is_airpods_model(model_id: u16) -> bool {
     matches!(
         model_id,
@@ -211,6 +228,7 @@ fn is_airpods_model(model_id: u16) -> bool {
     )
 }
 
+/// แปลงค่าระดับ 0–10 ใน BLE nibble เป็นเปอร์เซ็นต์ และปฏิเสธ sentinel อื่น
 fn battery_percent(nibble: u8) -> Option<u8> {
     match nibble {
         0x00..=0x0a => Some(nibble * 10),
@@ -218,6 +236,7 @@ fn battery_percent(nibble: u8) -> Option<u8> {
     }
 }
 
+/// รับเปอร์เซ็นต์จาก AACP เฉพาะช่วงที่ domain model รองรับ
 fn valid_percent(percent: u8) -> Option<u8> {
     (percent <= 100).then_some(percent)
 }

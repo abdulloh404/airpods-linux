@@ -1,4 +1,8 @@
-//! เชื่อม AACP เข้ากับ audio engine และ reconnect โดยไม่ปิด daemon
+//! ควบคุม AACP microphone session, audio engine และ recovery lifecycle
+//!
+//! worker นี้รอ AirPods ที่เลือกให้เชื่อม, เปิด AACP และ PipeWire virtual microphone แล้วส่ง AAC-ELD
+//! access units เข้า audio engine ระหว่าง stream จะรับ config, listening mode, battery notification และ shutdown
+//! พร้อม watchdog สำหรับเสียงเงียบ, decoder failure และ queue congestion ก่อน cleanup แล้ว reconnect ด้วย backoff
 
 use std::time::Duration;
 
@@ -15,32 +19,53 @@ use crate::{
     workers::AacpBatteryEvent,
 };
 
+/// เวลาสูงสุดตั้งแต่เริ่ม stream จน audio engine queue รับ access unit แรกได้
 const FIRST_AUDIO_TIMEOUT: Duration = Duration::from_secs(3);
+/// เวลาสูงสุดที่ไม่มี access unit ถูก queue หลัง stream เคยมีเสียงแล้ว
 const AUDIO_STALL_TIMEOUT: Duration = Duration::from_secs(3);
+/// จำนวน decode error ติดต่อกันที่ถือว่า AAC-ELD stream เสียและควร reconnect
 const DECODE_ERROR_LIMIT: u32 = 64;
+/// จำนวน queue-full ติดต่อกันที่ถือว่า PipeWire consumer ไม่ระบายข้อมูล
 const QUEUE_FULL_LIMIT: u32 = 256;
+/// เวลารอหลังสั่งเริ่ม microphone ก่อนสลับ A2DP profile เพื่อฟื้น playback route
 const A2DP_RESET_DELAY: Duration = Duration::from_millis(800);
+/// เวลารอให้ AirPods จัดการ STOP packet ก่อน reset A2DP profile
 const AACP_STOP_SETTLE_DELAY: Duration = Duration::from_millis(200);
+/// เวลารอให้ Bluetooth stack ส่ง listening-mode packet ก่อนปิด session ชั่วคราว
 const AACP_CONTROL_SETTLE_DELAY: Duration = Duration::from_millis(100);
+/// ระยะห่างของการขอ AACP battery notification ซ้ำ
 const AACP_NOTIFICATION_RETRY_DELAY: Duration = Duration::from_secs(2);
+/// จำนวนครั้งสูงสุดที่ขอ battery notification ซ้ำหลัง feature negotiation
 const AACP_NOTIFICATION_RETRY_LIMIT: u8 = 2;
+/// เวลาสูงสุดของแต่ละคำสั่ง `pactl` เพื่อไม่ให้ audio lifecycle ค้าง
 const PACTL_TIMEOUT: Duration = Duration::from_secs(2);
+/// จำนวนครั้งที่พยายามคืน A2DP profile เดิมหลังปิด profile ชั่วคราว
 const A2DP_RESTORE_ATTEMPTS: usize = 3;
+/// ระยะรอระหว่างความพยายามคืน A2DP profile
 const A2DP_RESTORE_RETRY_DELAY: Duration = Duration::from_millis(100);
 
+/// profile ที่ปิดแล้วแต่ยังคืนไม่สำเร็จ ใช้ serialize A2DP reset และ recovery ข้ามรอบ
 static A2DP_PENDING_RESTORE: Mutex<Option<(String, String)>> = Mutex::const_new(None);
 
+/// เหตุผลที่การเชื่อมหรือ stream หนึ่งรอบสิ้นสุด
 enum AttemptExit {
+    /// desired audio state เปลี่ยนและต้องเริ่มรอบใหม่โดยไม่เพิ่ม reconnect counter
     Reconfigure,
+    /// daemon กำลังปิดหรือ channel สำคัญถูกปิด
     Shutdown,
+    /// hardware, protocol หรือ audio pipeline ล้มเหลวและควรเข้าสู่ backoff
     Failed(String),
 }
 
+/// ผลของขั้นตอน START ที่แยก protocol completion ออกจาก cancellation ระหว่างรอ
 enum StartAudioExit {
+    /// AirPods ตอบผลของ START ตามปกติ
     Completed(anyhow::Result<()>),
+    /// config หรือ shutdown เปลี่ยนก่อน START เสร็จและต้อง cleanup session
     Cancelled(AttemptExit),
 }
 
+/// ทำ desired audio state ให้เป็นจริงต่อเนื่องและ reconnect เมื่อ stream ล้มเหลว
 pub async fn lifecycle_loop(
     state: SharedState,
     events: mpsc::UnboundedSender<Event>,
@@ -55,6 +80,7 @@ pub async fn lifecycle_loop(
         if *shutdown.borrow() {
             break;
         }
+        // clone ค่า watch ล่าสุดเป็นเป้าหมายคงที่ของหนึ่ง connection attempt
         let target = desired.borrow().clone();
         if !target.enabled {
             set_audio_status(&state, &events, "idle", false, 0, None).await;
@@ -115,6 +141,7 @@ pub async fn lifecycle_loop(
                     Some(error),
                 )
                 .await;
+                // exponential backoff เพิ่มจาก 1 ถึง 32 วินาทีและรีเซ็ตทันทีเมื่อมีคำสั่งใหม่
                 let seconds = 1_u64 << reconnect_attempt.saturating_sub(1).min(5);
                 tokio::select! {
                     _ = tokio::time::sleep(Duration::from_secs(seconds)) => {}
@@ -141,6 +168,7 @@ pub async fn lifecycle_loop(
     set_audio_status(&state, &events, "idle", false, 0, None).await;
 }
 
+/// เปิดและดูแล AACP กับ audio engine หนึ่งรอบจน reconfigure, shutdown หรือ failure
 async fn stream_once(
     state: &SharedState,
     events: &mpsc::UnboundedSender<Event>,
@@ -155,6 +183,7 @@ async fn stream_once(
         Ok(address) => address,
         Err(error) => return AttemptExit::Failed(error.to_string()),
     };
+    // ทุกขั้นตอน startup ที่อาจรอนานเปิดทางให้ desired state, mode request และ shutdown ยกเลิกได้
     let connected = tokio::select! {
         biased;
         result = bluez::wait_until_connected(address) => result,
@@ -220,6 +249,7 @@ async fn stream_once(
         return exit;
     }
 
+    // สร้าง engine ด้วย processing values ของ target เดียวกับที่ตรวจ stale แล้ว
     let mut audio_config = AudioConfig::default();
     audio_config.gain_db = target.gain_db as f32;
     audio_config.limiter_dbfs = target.limiter_db as f32;
@@ -237,6 +267,7 @@ async fn stream_once(
         let _ = engine.stop();
         return exit;
     }
+    // START อาจส่งถึง AirPods แล้วแม้ caller ยกเลิก จึงรวมทุกทางออกไว้ให้ cleanup เดียวกัน
     let start = tokio::select! {
         result = session.start_audio() => StartAudioExit::Completed(result),
         changed = desired.changed() => {
@@ -265,6 +296,7 @@ async fn stream_once(
         return exit;
     }
 
+    // reset A2DP แบบหน่วงเวลาใน task แยกเพื่อเริ่มรับ AACP packet ได้ทันที
     let reset_address = target.address.clone();
     let (cancel_reset, reset_cancelled) = oneshot::channel();
     let start_reset = tokio::spawn(async move {
@@ -279,6 +311,7 @@ async fn stream_once(
     });
 
     set_audio_status(state, events, "streaming", true, 0, None).await;
+    // buffer เดียวรองรับ L2CAP SDU ขนาดสูงสุดและนำกลับมาใช้ทุก receive
     let mut packet = vec![0_u8; 65_535];
     let stream_started = tokio::time::Instant::now();
     let mut last_queued_audio: Option<tokio::time::Instant> = None;
@@ -300,6 +333,7 @@ async fn stream_once(
                     break AttemptExit::Reconfigure;
                 }
                 if next.gain_db != target.gain_db || next.limiter_db != target.limiter_db {
+                    // gain และ limiter เปลี่ยนใน engine เดิมได้โดยไม่ตัด AACP stream
                     if let Err(error) = engine.set_processing(next.gain_db as f32, next.limiter_db as f32) {
                         break AttemptExit::Failed(error.to_string());
                     }
@@ -312,6 +346,7 @@ async fn stream_once(
                 }
             }
             Some(request) = mode_requests.recv() => {
+                // ใช้ session ปัจจุบันเฉพาะเมื่อ address ยังตรงกับ snapshot ตอนรับ D-Bus request
                 let result = if request.address.eq_ignore_ascii_case(&target.address) {
                     session
                         .set_listening_mode(request.mode)
@@ -323,6 +358,7 @@ async fn stream_once(
                 request.respond(result);
             }
             _ = watchdog.tick() => {
+                // ก่อน audio แรกให้นับจาก START และหลังจากนั้นให้นับจาก access unit ล่าสุดที่ queue สำเร็จ
                 let timed_out = match last_queued_audio {
                     Some(last_audio) => last_audio.elapsed() >= AUDIO_STALL_TIMEOUT,
                     None => stream_started.elapsed() >= FIRST_AUDIO_TIMEOUT,
@@ -332,6 +368,7 @@ async fn stream_once(
                 }
             }
             _ = &mut notification_retry, if notification_retry_pending => {
+                // บาง firmware ไม่ส่ง battery หลัง request แรก จึง retry แบบจำกัดโดยไม่หยุด audio
                 notification_retries = notification_retries.saturating_add(1);
                 if let Err(error) = session.request_notifications().await {
                     eprintln!("failed to retry AACP notifications: {error}");
@@ -352,12 +389,14 @@ async fn stream_once(
                 };
                 let sdu = &packet[..received];
                 if AacpSession::is_handshake_ack(sdu) {
+                    // handshake ack เปิดขั้นตอนตั้ง feature ที่ใช้รับ battery notification
                     if let Err(error) = session.set_specific_features().await {
                         eprintln!("failed to configure AACP battery notifications: {error}");
                     }
                     continue;
                 }
                 if AacpSession::is_features_ack(sdu) {
+                    // หลัง AirPods ยอมรับ feature แล้วจึงสมัคร notification และติดตั้ง retry timer
                     if let Err(error) = session.request_notifications().await {
                         eprintln!("failed to request AACP battery notifications: {error}");
                     }
@@ -369,6 +408,7 @@ async fn stream_once(
                     continue;
                 }
                 if let Some(update) = parse_aacp_battery(sdu) {
+                    // battery worker รวม partial update และเลือกแหล่งข้อมูลแทน audio loop
                     let _ = aacp_battery_events.send(AacpBatteryEvent::Update(update));
                     notification_retry_pending = false;
                     continue;
@@ -383,11 +423,13 @@ async fn stream_once(
                 for access_unit in access_units {
                     match engine.push_access_unit(access_unit) {
                         Ok(PushOutcome::Queued) => {
+                            // ความสำเร็จตัดลำดับ error ทั้งสองชนิดและเลื่อน watchdog ไปที่ packet นี้
                             last_queued_audio = Some(tokio::time::Instant::now());
                             decode_errors = 0;
                             queue_full = 0;
                         }
                         Ok(PushOutcome::DecodeError) => {
+                            // QueueFull ไม่ได้นับต่อเป็น decoder failure ติดต่อกัน
                             decode_errors = decode_errors.saturating_add(1);
                             queue_full = 0;
                             if decode_errors >= DECODE_ERROR_LIMIT {
@@ -397,6 +439,7 @@ async fn stream_once(
                             }
                         }
                         Ok(PushOutcome::QueueFull) => {
+                            // DecodeError ไม่ได้นับต่อเป็น queue congestion ติดต่อกัน
                             decode_errors = 0;
                             queue_full = queue_full.saturating_add(1);
                             if queue_full >= QUEUE_FULL_LIMIT {
@@ -412,6 +455,7 @@ async fn stream_once(
         }
     };
 
+    // ยกเลิก delayed reset ถ้ายังไม่เริ่ม แล้วรอ task จบก่อน cleanup เพื่อไม่ให้ pactl ทำงานซ้อนกัน
     let _ = cancel_reset.send(());
     let _ = start_reset.await;
     stop_stream(&mut session, &mut engine, &target.address).await;
@@ -420,6 +464,7 @@ async fn stream_once(
     outcome
 }
 
+/// หยุด AACP stream, คืน A2DP route และปิด audio engine สำหรับทุกทางออกหลัง START
 async fn stop_stream(session: &mut AacpSession, engine: &mut AudioEngine, address: &str) {
     let was_started = session.is_audio_started();
     let stopped = match session.stop_audio().await {
@@ -429,6 +474,7 @@ async fn stop_stream(session: &mut AacpSession, engine: &mut AudioEngine, addres
             false
         }
     };
+    // reset profile เฉพาะ session ที่เคย START เพื่อไม่รบกวน playback จาก startup failure ก่อนหน้านั้น
     if was_started {
         if stopped {
             tokio::time::sleep(AACP_STOP_SETTLE_DELAY).await;
@@ -440,8 +486,10 @@ async fn stop_stream(session: &mut AacpSession, engine: &mut AudioEngine, addres
     let _ = engine.stop();
 }
 
+/// สลับ active A2DP profile ผ่าน `off` แล้วคืนค่าเดิมเพื่อให้ PipeWire สร้าง playback route ใหม่
 async fn reset_a2dp(address: &str) -> anyhow::Result<()> {
     let mut pending_restore = A2DP_PENDING_RESTORE.lock().await;
+    // คืน profile ที่ค้างจากรอบก่อนให้สำเร็จก่อนเริ่ม reset ใหม่ ขณะถือ mutex เพื่อกัน task ซ้อน
     if let Some((card, profile)) = pending_restore.as_ref() {
         restore_card_profile(card, profile)
             .await
@@ -460,6 +508,7 @@ async fn reset_a2dp(address: &str) -> anyhow::Result<()> {
         );
     }
 
+    // `LC_ALL=C` ใน `run_pactl` ทำให้ prefix ที่ parse ด้านล่างคงรูปภาษาอังกฤษ
     let mut in_card = false;
     let mut active_profile = None;
     for line in String::from_utf8_lossy(&output.stdout).lines() {
@@ -476,9 +525,11 @@ async fn reset_a2dp(address: &str) -> anyhow::Result<()> {
         }
     }
 
+    // profile ชนิดอื่นไม่ใช่ playback A2DP ที่ flow นี้ควรสลับ
     let Some(profile) = active_profile.filter(|profile| profile.starts_with("a2dp-sink")) else {
         return Ok(());
     };
+    // บันทึก recovery target ก่อนสั่ง off เพื่อให้รอบถัดไปคืน profile ได้หากคำสั่ง restore ล้มเหลว
     *pending_restore = Some((card.clone(), profile.clone()));
     let off_result = set_card_profile(&card, "off").await;
     let restore_result = restore_card_profile(&card, &profile).await;
@@ -489,6 +540,7 @@ async fn reset_a2dp(address: &str) -> anyhow::Result<()> {
     off_result
 }
 
+/// คืน card profile ด้วย retry ระยะสั้นเพื่อรองรับ BlueZ/PipeWire ที่ยังสร้าง route ไม่พร้อม
 async fn restore_card_profile(card: &str, profile: &str) -> anyhow::Result<()> {
     let mut restore_error = None;
     for attempt in 0..A2DP_RESTORE_ATTEMPTS {
@@ -504,6 +556,7 @@ async fn restore_card_profile(card: &str, profile: &str) -> anyhow::Result<()> {
     Err(restore_error.expect("at least one A2DP restore attempt must run"))
 }
 
+/// เรียก `pactl set-card-profile` และแปลง exit status กับ stderr เป็น error
 async fn set_card_profile(card: &str, profile: &str) -> anyhow::Result<()> {
     let output = run_pactl(&["set-card-profile", card, profile])
         .await
@@ -518,6 +571,7 @@ async fn set_card_profile(card: &str, profile: &str) -> anyhow::Result<()> {
     }
 }
 
+/// รัน `pactl` ด้วย locale คงที่และ timeout ที่ยกเลิก child process เมื่อ future ถูก drop
 async fn run_pactl(args: &[&str]) -> anyhow::Result<std::process::Output> {
     let mut command = tokio::process::Command::new("pactl");
     command.env("LC_ALL", "C").args(args).kill_on_drop(true);
@@ -527,6 +581,7 @@ async fn run_pactl(args: &[&str]) -> anyhow::Result<std::process::Output> {
         .context("failed to run pactl")
 }
 
+/// ตรวจว่าค่าเป้าหมายหรือ shutdown เปลี่ยนระหว่างจุด startup ที่ไม่สามารถ cancel กลาง call ได้
 fn stale_startup(
     desired: &mut watch::Receiver<DesiredAudio>,
     shutdown: &watch::Receiver<bool>,
@@ -541,6 +596,7 @@ fn stale_startup(
     None
 }
 
+/// รอ config, listening mode หรือ shutdown ขณะ microphone ไม่มี active session
 async fn wait_for_action(
     desired: &mut watch::Receiver<DesiredAudio>,
     mode_requests: &mut mpsc::Receiver<ModeRequest>,
@@ -556,6 +612,7 @@ async fn wait_for_action(
     }
 }
 
+/// เปิด AACP control session ชั่วคราวสำหรับ listening mode แล้วตอบผลกลับไปยัง caller
 async fn send_mode_without_audio(request: ModeRequest) {
     let result = send_mode_once(&request.address, request.mode)
         .await
@@ -563,6 +620,7 @@ async fn send_mode_without_audio(request: ModeRequest) {
     request.respond(result);
 }
 
+/// ตรวจ connection แล้วส่ง listening mode ผ่าน AACP session แบบครั้งเดียว
 async fn send_mode_once(address: &str, mode: ListeningMode) -> anyhow::Result<()> {
     let address = address
         .parse()
@@ -579,6 +637,7 @@ async fn send_mode_once(address: &str, mode: ListeningMode) -> anyhow::Result<()
     Ok(())
 }
 
+/// อัปเดต audio fields ใน shared state และส่ง status snapshot ไปยัง D-Bus event forwarder
 async fn set_audio_status(
     state: &SharedState,
     events: &mpsc::UnboundedSender<Event>,
@@ -592,6 +651,7 @@ async fn set_audio_status(
         state.status.state = name.to_string();
         state.status.mic_active = mic_active;
         state.status.reconnect_attempt = reconnect_attempt;
+        // เก็บ error ล่าสุดระหว่าง recovery และล้างเมื่อกลับมา streaming สำเร็จ
         if let Some(error) = error {
             state.status.last_error = error;
         } else if mic_active {

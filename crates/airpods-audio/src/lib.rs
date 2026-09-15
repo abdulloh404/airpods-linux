@@ -1,4 +1,7 @@
 //! ครอบ C++ audio engine และเปิด API แบบ Rust ให้ `airpodsd`
+//!
+//! Rust layer ตรวจ config และ ownership ก่อนส่งผ่าน C ABI ส่วน native engine รับผิดชอบ
+//! AAC-ELD decoder, DSP, SPSC queue และ PipeWire realtime callback
 
 use anyhow::{Result, anyhow, bail};
 use std::{
@@ -10,59 +13,92 @@ use std::{
 pub const SAMPLE_RATE: u32 = 64_000;
 /// จำนวน channel ของ virtual microphone
 pub const CHANNELS: u8 = 1;
+/// ชื่อภายในของ PipeWire node ที่ client ใช้อ้างอิง source
 pub const SOURCE_NAME: &str = "Microphone_Virtual_Abdullohs_AirPods_Pro";
+/// ชื่อ PipeWire source ที่แสดงใน audio settings
 pub const SOURCE_DESCRIPTION: &str = "Microphone virtual - Abdulloh's AirPods Pro";
 /// gain เริ่มต้นก่อนเข้า limiter
 pub const DEFAULT_GAIN_DB: f32 = 0.0;
 /// limiter เริ่มต้นหน่วย dBFS
 pub const DEFAULT_LIMITER_DBFS: f32 = -3.0;
 
+/// ขนาด buffer ที่ C++ ใช้เขียนข้อความ error กลับมายัง Rust
 const ERROR_BUFFER_SIZE: usize = 512;
 
+/// opaque type ที่แทน C++ `airpods_audio_engine` โดย Rust ไม่เข้าถึง layout ภายใน
 #[repr(C)]
 struct NativeEngine {
+    /// ป้องกันการสร้างค่าชนิดนี้จากฝั่ง Rust โดยไม่ผ่าน native constructor
     _private: [u8; 0],
 }
 
+/// config ที่ส่งข้าม C ABI; pointer ของ string ต้องมีอายุถึง constructor คืนค่า
 #[repr(C)]
 struct NativeConfig {
+    /// pointer ไปยังชื่อ node แบบ null-terminated
     node_name: *const c_char,
+    /// pointer ไปยังคำอธิบาย node แบบ null-terminated
     node_description: *const c_char,
+    /// gain ก่อน limiter หน่วย dB
     gain_db: f32,
+    /// เพดาน limiter หน่วย dBFS
     limiter_dbfs: f32,
+    /// ความจุ physical queue หน่วย millisecond
     queue_capacity_ms: u32,
 }
 
+/// metric layout ที่ต้องตรงกับ `airpods_audio_metrics` ใน C++ header
 #[repr(C)]
 #[derive(Default)]
 struct NativeMetrics {
+    /// จำนวน access unit ที่ native engine รับ
     access_units: u64,
+    /// จำนวน frame ที่ decoder คืน PCM สำเร็จ
     decoded_frames: u64,
+    /// จำนวน PCM sample ที่ decoder คืนสำเร็จ
     decoded_samples: u64,
+    /// จำนวน frame ที่ใส่ queue ไม่ได้
     queue_drops: u64,
+    /// จำนวน access unit ที่ decoder ปฏิเสธ
     decode_errors: u64,
+    /// จำนวน callback ที่ sample ใน queue ไม่พอ
     underflows: u64,
+    /// จำนวน silence sample ที่ส่งออกทั้งหมด
     silence_samples: u64,
+    /// จำนวน sample เก่าที่ consumer ทิ้งเพื่อลด latency
     stale_samples_dropped: u64,
+    /// จำนวน silence sample ที่ใช้แทน frame เสีย
     concealed_samples: u64,
+    /// ช่องว่างมากที่สุดระหว่าง access unit หน่วย microsecond
     maximum_packet_gap_microseconds: u64,
+    /// jitter target ล่าสุดหน่วย sample
     target_samples: u64,
+    /// จำนวน sample ที่ callback ล่าสุดร้องขอ
     requested_samples: u64,
+    /// จำนวน sample สูงสุดที่ callback เคยร้องขอ
     maximum_requested_samples: u64,
+    /// clock correction ล่าสุดหน่วย parts per million
     rate_correction_ppm: i64,
+    /// จำนวน sample ที่ค้างใน queue ตอนเก็บ snapshot
     queued_samples: u64,
 }
 
+// ฟังก์ชันชุดนี้เป็น C ABI; ทุก pointer และ status ถูกแปลงเป็น API ที่ปลอดภัยกว่าใน `AudioEngine`
 unsafe extern "C" {
+    /// สร้าง native engine และคืน null พร้อมข้อความ error เมื่อสร้างไม่สำเร็จ
     fn airpods_audio_create(
         config: *const NativeConfig,
         error: *mut c_char,
         error_size: usize,
     ) -> *mut NativeEngine;
+    /// หยุด resource ที่ยังทำงานและทำลาย native engine
     fn airpods_audio_destroy(engine: *mut NativeEngine);
+    /// เริ่ม PipeWire thread โดยคืนศูนย์เมื่อสำเร็จ
     fn airpods_audio_start(engine: *mut NativeEngine, error: *mut c_char, error_size: usize)
     -> i32;
+    /// หยุด PipeWire thread โดยคืนศูนย์เมื่อสำเร็จ
     fn airpods_audio_stop(engine: *mut NativeEngine, error: *mut c_char, error_size: usize) -> i32;
+    /// ส่ง AAC-ELD access unit ให้ decoder และคืนสถานะ queue/decode
     fn airpods_audio_push(
         engine: *mut NativeEngine,
         data: *const u8,
@@ -70,6 +106,7 @@ unsafe extern "C" {
         error: *mut c_char,
         error_size: usize,
     ) -> i32;
+    /// เปลี่ยน gain และ limiter ที่ native engine ใช้กับ frame ถัดไป
     fn airpods_audio_set_processing(
         engine: *mut NativeEngine,
         gain_db: f32,
@@ -77,7 +114,9 @@ unsafe extern "C" {
         error: *mut c_char,
         error_size: usize,
     ) -> i32;
+    /// คืนค่าที่ไม่ใช่ศูนย์เมื่อ PipeWire thread ยังทำงาน
     fn airpods_audio_is_running(engine: *const NativeEngine) -> i32;
+    /// copy metric snapshot ลง struct ที่ caller จัดเตรียม
     fn airpods_audio_get_metrics(engine: *const NativeEngine, metrics: *mut NativeMetrics);
 }
 
@@ -97,6 +136,7 @@ pub struct AudioConfig {
 }
 
 impl Default for AudioConfig {
+    /// สร้าง config สำหรับ mono source พร้อม physical queue 250 ms
     fn default() -> Self {
         Self {
             node_name: SOURCE_NAME.to_string(),
@@ -271,11 +311,13 @@ impl AudioEngine {
 }
 
 impl Drop for AudioEngine {
+    /// ส่ง ownership คืน C++ เพื่อหยุด thread และปล่อย resource ทั้งหมด
     fn drop(&mut self) {
         unsafe { airpods_audio_destroy(self.native.as_ptr()) };
     }
 }
 
+/// ตรวจค่าที่ส่งให้ DSP ให้เป็น finite และอยู่ในช่วงเดียวกับ native engine
 fn validate_processing(gain_db: f32, limiter_dbfs: f32) -> Result<()> {
     if !gain_db.is_finite() || !(0.0..=30.0).contains(&gain_db) {
         bail!("microphone gain must be between 0 and 30 dB");
@@ -286,6 +328,7 @@ fn validate_processing(gain_db: f32, limiter_dbfs: f32) -> Result<()> {
     Ok(())
 }
 
+/// แปลง status แบบ C และ error buffer เป็น `anyhow::Result`
 fn call_status(call: impl FnOnce(*mut c_char) -> i32) -> Result<()> {
     let mut error = error_buffer();
     let status = call(error.as_mut_ptr());
@@ -296,10 +339,12 @@ fn call_status(call: impl FnOnce(*mut c_char) -> i32) -> Result<()> {
     }
 }
 
+/// สร้าง buffer ที่มี null terminator ตั้งแต่ต้นสำหรับกรณี native ไม่เขียนข้อความ
 fn error_buffer() -> [c_char; ERROR_BUFFER_SIZE] {
     [0; ERROR_BUFFER_SIZE]
 }
 
+/// อ่าน C string จาก native layer และมี fallback เมื่อไม่มีข้อความ error
 fn native_error(error: &[c_char; ERROR_BUFFER_SIZE]) -> anyhow::Error {
     let message = unsafe { CStr::from_ptr(error.as_ptr()) }.to_string_lossy();
     if message.is_empty() {

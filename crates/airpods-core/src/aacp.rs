@@ -1,4 +1,7 @@
 //! จัดการ AACP session ผ่าน Bluetooth L2CAP แบบ `SeqPacket`
+//!
+//! flow หลักคือเชื่อมต่อ PSM เฉพาะของ AACP รอให้ kernel ยืนยัน peer แล้วส่ง
+//! handshake และ feature command ก่อนรับ notification หรือสั่ง microphone stream
 
 use anyhow::{Context, Result, bail};
 use bluer::{
@@ -8,30 +11,43 @@ use bluer::{
 use log::{debug, info};
 use std::{sync::Arc, time::Duration};
 
+/// PSM ที่ AirPods เปิดไว้สำหรับ AACP บน Bluetooth BR/EDR
 const AACP_PSM: u16 = 0x1001;
+/// เวลาสูงสุดสำหรับสร้าง connection และรอ peer พร้อมใช้งาน
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// เวลาสูงสุดของการส่ง packet หนึ่งครั้งรวมช่วง retry
 const IO_TIMEOUT: Duration = Duration::from_secs(3);
+/// ช่วงพักระหว่างตรวจ connection หรือ retry เมื่อ socket ยังไม่พร้อม
 const CONNECTION_POLL_INTERVAL: Duration = Duration::from_millis(100);
+/// จำนวนครั้งสูงสุดที่ยอม retry หลัง kernel คืน `ENOTCONN`
 const SEND_RETRY_LIMIT: usize = 10;
 
+/// packet เริ่มต้นที่เปิด AACP session
 const AACP_HANDSHAKE: [u8; 16] = [
     0x00, 0x00, 0x04, 0x00, 0x01, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
 ];
+/// packet เลือก feature ที่จำเป็นต่อ notification ของ session
 const AACP_SET_SPECIFIC_FEATURES: [u8; 14] = [
     0x04, 0x00, 0x04, 0x00, 0x4d, 0x00, 0xd7, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
 ];
+/// packet สมัครรับ AACP notifications ทุกชนิดที่อุปกรณ์รองรับ
 const AACP_REQUEST_NOTIFICATIONS: [u8; 10] = [
     0x04, 0x00, 0x04, 0x00, 0x0f, 0x00, 0xff, 0xff, 0xff, 0xff,
 ];
+/// prefix ที่ใช้ยืนยันว่า AirPods ตอบ handshake แล้ว
 const AACP_HANDSHAKE_ACK_PREFIX: [u8; 4] = [0x01, 0x00, 0x04, 0x00];
+/// prefix ที่ใช้ยืนยันว่า AirPods รับ feature setup แล้ว
 const AACP_FEATURES_ACK_PREFIX: [u8; 6] = [0x04, 0x00, 0x04, 0x00, 0x2b, 0x00];
+/// packet เปิด AAC-ELD microphone stream
 const AACP_START_AUDIO: [u8; 19] = [
     0x04, 0x00, 0x04, 0x00, 0x58, 0x00, 0x00, 0x00, 0x09, 0x00, 0x00, 0x01, 0x82, 0x00, 0x00, 0x00,
     0x04, 0x96, 0x00,
 ];
+/// packet ปิด microphone stream ที่เปิดผ่าน AACP
 const AACP_STOP_AUDIO: [u8; 12] = [
     0x04, 0x00, 0x04, 0x00, 0x58, 0x00, 0x00, 0x00, 0x02, 0x00, 0x03, 0x01,
 ];
+/// template ของ control command ที่แทนค่า listening mode ที่ index 7
 const AACP_SET_LISTENING_MODE: [u8; 11] = [
     0x04, 0x00, 0x04, 0x00, 0x09, 0x00, 0x0D, 0x00, 0x00, 0x00, 0x00,
 ];
@@ -40,9 +56,13 @@ const AACP_SET_LISTENING_MODE: [u8; 11] = [
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]
 pub enum ListeningMode {
+    /// ปิดทั้ง noise cancellation และ transparency
     Off = 0x01,
+    /// เปิด active noise cancellation
     NoiseCancellation = 0x02,
+    /// เปิด transparency เพื่อรับเสียงภายนอก
     Transparency = 0x03,
+    /// ให้อุปกรณ์ปรับระดับการตัดเสียงตามสภาพแวดล้อม
     Adaptive = 0x04,
 }
 
@@ -71,7 +91,9 @@ impl ListeningMode {
 
 /// AACP transport หนึ่ง session สำหรับ AirPods หนึ่งคู่
 pub struct AacpSession {
+    /// socket ใช้ `Arc` เพื่อให้ future รับและส่งยืม transport เดียวกันได้อย่างปลอดภัย
     socket: Arc<SeqPacket>,
+    /// บันทึกว่า START สำเร็จแล้ว เพื่อไม่ส่งคำสั่งซ้ำและใช้ตัดสินใจส่ง STOP
     started: bool,
 }
 
@@ -86,6 +108,7 @@ impl AacpSession {
             .context("AACP L2CAP connection failed")?;
 
         let socket = Arc::new(socket);
+        // `connect` อาจคืนก่อน L2CAP peer มี CID จึง poll จนพร้อมหรือหมดเวลา
         tokio::time::timeout(CONNECT_TIMEOUT, async {
             loop {
                 match socket.peer_addr() {
@@ -194,11 +217,13 @@ impl AacpSession {
         self.started
     }
 
+    /// ส่ง packet ให้ครบทั้งก้อน เพราะ AACP ใช้ขอบเขต SDU ของ `SeqPacket`
     async fn send(&self, packet: &[u8]) -> Result<()> {
         let send = async {
             let mut attempts = 0;
             loop {
                 match self.socket.send(packet).await {
+                    // kernel อาจยังรายงาน `ENOTCONN` ชั่วคราวหลังสร้าง L2CAP socket สำเร็จ
                     Err(error)
                         if error.raw_os_error() == Some(libc::ENOTCONN)
                             && attempts < SEND_RETRY_LIMIT =>

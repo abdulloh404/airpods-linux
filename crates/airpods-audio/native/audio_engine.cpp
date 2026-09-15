@@ -1,5 +1,8 @@
 #include "audio_engine.h"
 
+// รับ AAC-ELD access unit จาก Rust, decode และทำ DSP บน producer thread แล้วส่ง PCM
+// ผ่าน SPSC queue ให้ PipeWire realtime callback ซึ่งควบคุม jitter, latency และ clock drift
+
 #include <aacdecoder_lib.h>
 #include <pipewire/pipewire.h>
 #include <spa/node/io.h>
@@ -25,31 +28,46 @@
 
 namespace {
 
+// รูปแบบ PCM ที่ PipeWire source เผยแพร่และ FDK-AAC decoder คืนให้ pipeline
 constexpr uint32_t kSampleRate = 64'000;
 constexpr uint32_t kChannels = 1;
+// AAC-ELD stream ของ AirPods ให้ PCM 480 sample ต่อ access unit
 constexpr size_t kAacFrameSamples = 480;
+// buffer decode ต้องใหญ่พอรับ frame ที่ FDK-AAC รายงานก่อนตรวจขนาดจริง
 constexpr size_t kPcmBufferSamples = 8'192;
+// jitter target เริ่มที่ 60 ms และปรับในช่วง 40–80 ms จาก packet gap
 constexpr uint32_t kInitialJitterTargetMs = 60;
 constexpr uint32_t kMinimumJitterTargetMs = 40;
 constexpr uint32_t kMaximumJitterTargetMs = 80;
+// backlog เกิน 150 ms ถือว่าเก่าและถูกทิ้งเพื่อลด latency
 constexpr uint32_t kHardJitterLimitMs = 150;
+// เก็บ peak packet gap เป็นหน้าต่างละสองวินาทีก่อนปรับ target
 constexpr uint64_t kJitterWindowMicroseconds = 2'000'000;
 constexpr uint64_t kJitterTargetStepMicroseconds = 20'000;
+// rate controller ปรับค่าเฉลี่ย fill level ด้วย time constant หนึ่งวินาที
 constexpr double kRateControlPeriodSeconds = 1.0;
+// จำกัด clock correction ที่ร้อยละ 0.5 เพื่อไม่ให้เสียงผิดความเร็วมากเกินไป
 constexpr double kMaximumRateCorrection = 0.005;
+// ขอ PipeWire quantum เริ่มต้น 10 ms ที่ sample rate 64 kHz
 constexpr char kNodeLatency[] = "640/64000";
+// ขอบเขต DSP ต้องตรงกับ validation ใน Rust wrapper
 constexpr float kMinGainDb = 0.0F;
 constexpr float kMaxGainDb = 30.0F;
 constexpr float kMinLimiterDbfs = -12.0F;
 constexpr float kMaxLimiterDbfs = 0.0F;
+// limiter คืน gain สู่ 1.0 อย่างค่อยเป็นค่อยไปในเวลาประมาณ 100 ms
 constexpr float kLimiterReleaseSeconds = 0.1F;
+// AudioSpecificConfig สำหรับ AAC-ELD mono stream ที่ AirPods ส่ง
 constexpr std::array<UCHAR, 4> kEldAsc = {0xF8, 0xE6, 0x30, 0x00};
+// frame เงียบหนึ่งก้อนใช้รักษา timeline เมื่อ decoder ปฏิเสธ access unit
 constexpr std::array<int16_t, kAacFrameSamples> kConcealmentSilence{};
 
+// แปลงเวลาเป็นจำนวน sample ด้วย sample rate คงที่ของ pipeline
 constexpr size_t samples_for_milliseconds(uint32_t milliseconds) noexcept {
     return static_cast<size_t>(kSampleRate) * milliseconds / 1'000;
 }
 
+// เพิ่มค่า maximum แบบ lock-free โดยไม่ลดค่าที่ thread อื่นบันทึกไว้แล้ว
 void update_maximum(std::atomic<uint64_t> &value, uint64_t candidate) noexcept {
     uint64_t current = value.load(std::memory_order_relaxed);
     while (current < candidate &&
@@ -58,6 +76,7 @@ void update_maximum(std::atomic<uint64_t> &value, uint64_t candidate) noexcept {
     }
 }
 
+// copy error ข้าม C ABI พร้อม null terminator และรองรับ caller ที่ไม่ส่ง buffer
 void write_error(char *buffer, size_t size, const std::string &message) noexcept {
     if (buffer == nullptr || size == 0) {
         return;
@@ -67,6 +86,7 @@ void write_error(char *buffer, size_t size, const std::string &message) noexcept
     buffer[length] = '\0';
 }
 
+// ปฏิเสธ NaN, infinity และค่าที่ DSP ไม่รองรับก่อนคำนวณ coefficient
 void validate_processing(float gain_db, float limiter_dbfs) {
     if (!std::isfinite(gain_db) || gain_db < kMinGainDb || gain_db > kMaxGainDb) {
         throw std::invalid_argument("microphone gain must be between 0 and 30 dB");
@@ -77,14 +97,17 @@ void validate_processing(float gain_db, float limiter_dbfs) {
     }
 }
 
+// ring buffer แบบ single-producer/single-consumer สำหรับส่ง PCM จาก caller ไป PipeWire thread
 class SpscBuffer final {
   public:
+    // จองช่องเพิ่มหนึ่งตำแหน่งเพื่อแยกสถานะเต็มออกจากสถานะว่างโดยไม่ใช้ counter ร่วม
     explicit SpscBuffer(size_t capacity) : samples_(capacity + 1) {
         if (capacity == 0) {
             throw std::invalid_argument("audio queue capacity must not be zero");
         }
     }
 
+    // copy frame ทั้งก้อนและ publish head หลังเขียน sample ครบ; ไม่รับ frame บางส่วน
     bool push(const int16_t *samples, size_t count) noexcept {
         const size_t head = head_.load(std::memory_order_relaxed);
         const size_t tail = tail_.load(std::memory_order_acquire);
@@ -98,6 +121,7 @@ class SpscBuffer final {
         return true;
     }
 
+    // copy ได้ไม่เกินจำนวนที่มีแล้ว publish tail ให้ producer เห็นพื้นที่ว่าง
     size_t pop(int16_t *output, size_t count) noexcept {
         const size_t tail = tail_.load(std::memory_order_relaxed);
         const size_t head = head_.load(std::memory_order_acquire);
@@ -110,6 +134,7 @@ class SpscBuffer final {
         return copied;
     }
 
+    // เลื่อน consumer tail เพื่อทิ้ง sample เก่าโดยไม่แตะ producer head
     size_t discard(size_t count) noexcept {
         const size_t tail = tail_.load(std::memory_order_relaxed);
         const size_t head = head_.load(std::memory_order_acquire);
@@ -118,32 +143,41 @@ class SpscBuffer final {
         return discarded;
     }
 
+    // อ่านจำนวน sample ปัจจุบันจาก snapshot ของ head และ tail
     size_t size() const noexcept {
         return size_from(head_.load(std::memory_order_acquire),
                          tail_.load(std::memory_order_acquire));
     }
 
+    // รีเซ็ต queue ตอนยังไม่มี producer/consumer ทำงานใน lifecycle ใหม่
     void clear() noexcept {
         tail_.store(0, std::memory_order_relaxed);
         head_.store(0, std::memory_order_relaxed);
     }
 
   private:
+    // คำนวณระยะทางแบบวนรอบจาก consumer tail ถึง producer head
     size_t size_from(size_t head, size_t tail) const noexcept {
         return head >= tail ? head - tail : samples_.size() - (tail - head);
     }
 
+    // เว้นหนึ่งช่องไว้เป็น sentinel จึงหักหนึ่งจากพื้นที่ที่ยังใช้ได้
     size_t free_space(size_t head, size_t tail) const noexcept {
         return samples_.size() - size_from(head, tail) - 1;
     }
 
+    // storage ของ PCM sample ใน ring buffer
     std::vector<int16_t> samples_;
+    // producer เขียน head และ consumer อ่านด้วย acquire/release เพื่อเห็น sample ที่เขียนครบแล้ว
     alignas(64) std::atomic<size_t> head_{0};
+    // consumer เขียน tail และ producer อ่านด้วย acquire/release เพื่อเห็นพื้นที่ที่คืนแล้ว
     alignas(64) std::atomic<size_t> tail_{0};
 };
 
+// RAII wrapper ของ FDK-AAC decoder ที่กำหนดรูปแบบ AAC-ELD ตั้งแต่ constructor
 class Decoder final {
   public:
+    // สร้าง raw transport decoder และใช้ AudioSpecificConfig ของ AirPods
     Decoder() {
         handle_ = aacDecoder_Open(TT_MP4_RAW, 1);
         if (handle_ == nullptr) {
@@ -162,15 +196,18 @@ class Decoder final {
         }
     }
 
+    // ปิด FDK-AAC handle เมื่อ object สิ้นอายุ
     ~Decoder() {
         if (handle_ != nullptr) {
             aacDecoder_Close(handle_);
         }
     }
 
+    // decoder มี handle และ PCM workspace เดียว จึงห้าม copy ownership
     Decoder(const Decoder &) = delete;
     Decoder &operator=(const Decoder &) = delete;
 
+    // ป้อน access unit หนึ่งก้อนและคืน pointer ไปยัง PCM workspace ภายในพร้อมจำนวน sample
     std::pair<int16_t *, size_t> decode(const uint8_t *data, size_t size) {
         if (data == nullptr || size == 0 || size > std::numeric_limits<UINT>::max()) {
             throw std::invalid_argument("invalid AAC-ELD access unit");
@@ -191,6 +228,7 @@ class Decoder final {
             throw std::runtime_error("FDK-AAC failed to decode the AAC-ELD access unit");
         }
 
+        // เชื่อข้อมูลรูปแบบจาก decoder หลัง decode สำเร็จ แต่ยังตรวจ mono และขนาด buffer ทุกครั้ง
         const CStreamInfo *info = aacDecoder_GetStreamInfo(handle_);
         if (info == nullptr || info->frameSize <= 0 || info->numChannels != 1) {
             throw std::runtime_error("FDK-AAC returned an invalid mono PCM format");
@@ -203,11 +241,15 @@ class Decoder final {
     }
 
   private:
+    // FDK-AAC handle ที่ class นี้เป็นเจ้าของ
     HANDLE_AACDECODER handle_{nullptr};
+    // workspace ที่ถูกเขียนทับในการ decode ครั้งถัดไป จึงใช้ได้จนถึง push ถัดไปเท่านั้น
     std::array<int16_t, kPcmBufferSamples> pcm_{};
 };
 
+// counter ข้าม producer และ PipeWire thread ใช้ atomic เพื่ออ่าน snapshot โดยไม่ lock realtime callback
 struct Metrics final {
+    // counter ฝั่ง producer สำหรับ input, decode และ queue
     std::atomic<uint64_t> access_units{0};
     std::atomic<uint64_t> decoded_frames{0};
     std::atomic<uint64_t> decoded_samples{0};
@@ -217,14 +259,17 @@ struct Metrics final {
     std::atomic<uint64_t> silence_samples{0};
     std::atomic<uint64_t> stale_samples_dropped{0};
     std::atomic<uint64_t> concealed_samples{0};
+    // ค่าสูงสุดและสถานะฝั่ง jitter/consumer
     std::atomic<uint64_t> maximum_packet_gap_microseconds{0};
     std::atomic<uint64_t> requested_samples{0};
     std::atomic<uint64_t> maximum_requested_samples{0};
     std::atomic<int64_t> rate_correction_ppm{0};
 };
 
+// เป็นเจ้าของ decoder, DSP state, SPSC queue และ lifecycle ของ PipeWire source
 class Engine final {
   public:
+    // copy string จาก C config และสร้างทุก resource ที่ไม่ต้องพึ่ง PipeWire thread
     explicit Engine(const airpods_audio_config &config)
         : node_name_(required_string(config.node_name, "PipeWire node name")),
           node_description_(required_string(config.node_description,
@@ -237,10 +282,12 @@ class Engine final {
                                    samples_for_milliseconds(kInitialJitterTargetMs))),
           decoder_() {
         set_processing(config.gain_db, config.limiter_dbfs);
+        // PipeWire กำหนดให้ process เรียก `pw_init` ครั้งเดียวก่อนใช้ API อื่น
         static std::once_flag initialized;
         std::call_once(initialized, [] { pw_init(nullptr, nullptr); });
     }
 
+    // destructor ต้องไม่ปล่อย exception ข้าม RAII boundary และพยายามหยุด thread เสมอ
     ~Engine() noexcept {
         try {
             stop();
@@ -248,9 +295,11 @@ class Engine final {
         }
     }
 
+    // engine ผูกกับ thread, decoder และ pointer ของ PipeWire จึงห้าม copy
     Engine(const Engine &) = delete;
     Engine &operator=(const Engine &) = delete;
 
+    // รีเซ็ต state ต่อ session แล้วเริ่ม thread โดยรอผล startup ผ่าน promise
     void start() {
         if (running_.load(std::memory_order_acquire)) {
             return;
@@ -258,6 +307,7 @@ class Engine final {
         if (thread_.joinable()) {
             thread_.join();
         }
+        // ค่า session เดิมต้องไม่รั่วเข้าสู่ stream รอบใหม่ ทั้ง queue, jitter และ clock state
         queue_.clear();
         target_samples_.store(
             std::min(hard_limit_samples_,
@@ -279,6 +329,7 @@ class Engine final {
         metrics_.requested_samples.store(0, std::memory_order_relaxed);
         metrics_.rate_correction_ppm.store(0, std::memory_order_relaxed);
 
+        // caller รอจน thread สร้างและส่งคำขอ connect stream สำเร็จ จึงไม่รายงาน running ก่อนกำหนดค่า source
         std::promise<std::string> ready;
         auto future = ready.get_future();
         thread_ = std::thread([this, ready = std::move(ready)]() mutable {
@@ -291,6 +342,7 @@ class Engine final {
         }
     }
 
+    // ขอหยุด main loop ภายใต้ mutex แล้ว join เพื่อรับประกันว่า PipeWire resource ถูกทำลายครบ
     void stop() {
         running_.store(false, std::memory_order_release);
         {
@@ -304,6 +356,7 @@ class Engine final {
         }
     }
 
+    // decode และทำ DSP บน producer thread ก่อนส่ง PCM frame ทั้งก้อนเข้า SPSC queue
     int push(const uint8_t *data, size_t size) {
         if (!running_.load(std::memory_order_acquire)) {
             throw std::runtime_error("PipeWire virtual microphone is not running");
@@ -316,6 +369,7 @@ class Engine final {
         try {
             std::tie(samples, count) = decoder_.decode(data, size);
         } catch (const std::exception &) {
+            // รักษาเวลา audio ด้วย frame เงียบเมื่อ decode เสีย แต่ยังรายงานสถานะ 2 ให้ caller ทราบ
             metrics_.decode_errors.fetch_add(1, std::memory_order_relaxed);
             if (queue_.push(kConcealmentSilence.data(),
                             kConcealmentSilence.size())) {
@@ -337,6 +391,7 @@ class Engine final {
         return 0;
     }
 
+    // แปลงหน่วย dB เป็น linear coefficient และรีเซ็ต envelope ของ limiter
     void set_processing(float gain_db, float limiter_dbfs) {
         validate_processing(gain_db, limiter_dbfs);
         gain_linear_ = std::pow(10.0F, gain_db / 20.0F);
@@ -345,8 +400,10 @@ class Engine final {
         limiter_gain_ = 1.0F;
     }
 
+    // อ่านสถานะ lifecycle ที่ PipeWire thread publish ไว้
     bool running() const noexcept { return running_.load(std::memory_order_acquire); }
 
+    // copy atomic counters และ queue depth เป็น snapshot ที่ไม่ block realtime callback
     void metrics(airpods_audio_metrics &output) const noexcept {
         output.access_units = metrics_.access_units.load(std::memory_order_relaxed);
         output.decoded_frames = metrics_.decoded_frames.load(std::memory_order_relaxed);
@@ -374,6 +431,7 @@ class Engine final {
     }
 
   private:
+    // copy C string ที่ caller ต้องส่งให้ครบและไม่ว่าง
     static std::string required_string(const char *value, const char *field) {
         if (value == nullptr || value[0] == '\0') {
             throw std::invalid_argument(std::string(field) + " must not be empty");
@@ -381,6 +439,7 @@ class Engine final {
         return value;
     }
 
+    // แปลงความจุจาก millisecond เป็น sample พร้อมจำกัด memory allocation สูงสุด
     static size_t queue_capacity(uint32_t milliseconds) {
         if (milliseconds == 0 || milliseconds > 5'000) {
             throw std::invalid_argument("audio queue capacity must be between 1 and 5000 ms");
@@ -388,6 +447,7 @@ class Engine final {
         return static_cast<size_t>(kSampleRate) * milliseconds / 1'000;
     }
 
+    // เก็บ packet gap และปรับ jitter target ทุกหน้าต่างสองวินาที
     void observe_access_unit_arrival() noexcept {
         const auto now = std::chrono::steady_clock::now();
         if (jitter_window_started_ == std::chrono::steady_clock::time_point{}) {
@@ -433,6 +493,7 @@ class Engine final {
         jitter_window_peak_gap_microseconds_ = 0;
     }
 
+    // ใช้ gain แล้วจำกัด peak ด้วย limiter ที่ลดทันทีและ release แบบ exponential
     void process(int16_t *samples, size_t count) noexcept {
         const float release =
             1.0F - std::exp(-1.0F / (static_cast<float>(kSampleRate) *
@@ -451,10 +512,12 @@ class Engine final {
         }
     }
 
+    // trampoline จาก PipeWire C callback เข้าสู่ Engine instance
     static void on_process(void *data) noexcept {
         static_cast<Engine *>(data)->process_pipewire_buffer();
     }
 
+    // รับ pointer ของ RateMatch และ Position IO area ที่ PipeWire เป็นเจ้าของ
     static void on_io_changed(void *data, uint32_t id, void *area,
                               uint32_t size) noexcept {
         auto *engine = static_cast<Engine *>(data);
@@ -473,6 +536,7 @@ class Engine final {
         }
     }
 
+    // ปิดสถานะ running และออก main loop ทันทีเมื่อ PipeWire stream เข้า error state
     static void on_state_changed(void *data, enum pw_stream_state,
                                  enum pw_stream_state state,
                                  const char *) noexcept {
@@ -486,6 +550,7 @@ class Engine final {
         }
     }
 
+    // หาจำนวน sample ที่ graph ต้องการ โดยให้ RateMatch มาก่อน Position และ fallback ที่ 10 ms
     size_t requested_sample_count(size_t capacity) noexcept {
         if (capacity == 0) {
             return 0;
@@ -508,6 +573,7 @@ class Engine final {
                 position_rate_numerator_ = numerator;
                 position_rate_denominator_ = denominator;
             }
+            // เก็บเศษของอัตราส่วนข้าม callback เพื่อไม่ให้การปัดจำนวน frame ทำให้ clock drift
             const __uint128_t scaled =
                 static_cast<__uint128_t>(position->clock.duration) * kSampleRate *
                     numerator +
@@ -522,6 +588,7 @@ class Engine final {
         return std::min(capacity, samples_for_milliseconds(10));
     }
 
+    // ตั้ง controller ให้เริ่มจาก queue target ปัจจุบันและปิด RateMatch correction
     void reset_rate_control(spa_io_rate_match *rate_match,
                             size_t target_samples) noexcept {
         fill_average_seconds_ = static_cast<double>(target_samples) /
@@ -534,6 +601,7 @@ class Engine final {
         }
     }
 
+    // ปรับ RateMatch จากค่าเฉลี่ย queue fill เพื่อชดเชย clock drift ระยะยาว
     void update_rate_control(spa_io_rate_match *rate_match, size_t queued_samples,
                              size_t target_samples,
                              size_t requested_samples) noexcept {
@@ -548,6 +616,7 @@ class Engine final {
                                       static_cast<double>(kSampleRate);
         const double level_seconds = static_cast<double>(queued_samples) /
                                      static_cast<double>(kSampleRate);
+        // beta ผูกกับเวลาจริงของ callback เพื่อให้ smoothing คงพฤติกรรมเมื่อ quantum เปลี่ยน
         const double beta =
             std::clamp(cycle_seconds / kRateControlPeriodSeconds, 0.0, 1.0);
         const double previous_average = fill_average_seconds_;
@@ -568,6 +637,7 @@ class Engine final {
             std::memory_order_relaxed);
     }
 
+    // เติม PipeWire buffer จาก queue โดยห้าม throw, allocate หรือรอ lock ใน realtime callback
     void process_pipewire_buffer() noexcept {
         pw_stream *stream = stream_.load(std::memory_order_acquire);
         if (stream == nullptr) {
@@ -616,6 +686,7 @@ class Engine final {
             reset_rate_control(rate_match, target_samples);
         }
 
+        // เริ่มปล่อยเสียงเมื่อ queue มีอย่างน้อย jitter target หรือหนึ่ง callback เต็ม
         const size_t start_threshold =
             std::min(queue_capacity_samples_,
                      std::max(target_samples, requested_samples));
@@ -640,6 +711,7 @@ class Engine final {
         update_rate_control(rate_match, queued_samples, target_samples,
                             requested_samples);
         const size_t copied = queue_.pop(output, requested_samples);
+        // เติมส่วนที่ขาดด้วย silence และกลับเข้า buffering เพื่อสะสม jitter reserve ใหม่
         std::fill(output + copied, output + requested_samples, 0);
         if (copied < requested_samples) {
             metrics_.underflows.fetch_add(1, std::memory_order_relaxed);
@@ -657,6 +729,7 @@ class Engine final {
         pw_stream_queue_buffer(stream, buffer);
     }
 
+    // สร้างและรัน PipeWire main loop บน thread เฉพาะ พร้อมรายงาน startup ครั้งเดียวผ่าน promise
     void thread_main(std::promise<std::string> ready) noexcept {
         pw_main_loop *loop = nullptr;
         pw_stream *stream = nullptr;
@@ -679,6 +752,7 @@ class Engine final {
                 throw std::runtime_error("failed to create PipeWire properties");
             }
 
+            // callback table มีอายุแบบ static ตลอดเวลาที่ PipeWire stream อ้างถึง
             static const pw_stream_events events = {
                 .version = PW_VERSION_STREAM_EVENTS,
                 .destroy = nullptr,
@@ -700,11 +774,13 @@ class Engine final {
             }
 
             {
+                // publish main loop ภายใต้ mutex เพื่อให้ `stop` เรียก quit ได้โดยไม่ชน teardown
                 std::lock_guard<std::mutex> lock(lifecycle_mutex_);
                 main_loop_ = loop;
             }
             stream_.store(stream, std::memory_order_release);
 
+            // ประกาศ source เป็น mono S16_LE 64 kHz และให้ PipeWire map buffer สำหรับ RT callback
             std::array<uint8_t, 1'024> pod_buffer{};
             spa_pod_builder builder{};
             spa_pod_builder_init(&builder, pod_buffer.data(), pod_buffer.size());
@@ -723,6 +799,7 @@ class Engine final {
                 throw std::runtime_error("failed to connect the PipeWire source stream");
             }
 
+            // publish running หลัง connect สำเร็จแล้วจึงปลุก caller ของ `start`
             running_.store(true, std::memory_order_release);
             ready.set_value({});
             pw_main_loop_run(loop);
@@ -740,6 +817,7 @@ class Engine final {
             }
         }
 
+        // teardown pointer ที่ callback และ `stop` มองเห็นก่อนทำลาย main loop
         if (stream != nullptr) {
             pw_stream_destroy(stream);
         }
@@ -757,29 +835,40 @@ class Engine final {
         running_.store(false, std::memory_order_release);
     }
 
+    // ค่า config ที่ copy มาและมีอายุเท่ากับ engine
     std::string node_name_;
     std::string node_description_;
+    // ขอบเขต queue คงที่ตลอดอายุ engine
     const size_t queue_capacity_samples_;
     const size_t hard_limit_samples_;
+    // producer คือ `push`; consumer คือ PipeWire process callback
     SpscBuffer queue_;
+    // jitter target ถูก producer ปรับและ consumer อ่าน
     std::atomic<size_t> target_samples_;
+    // decoder และ DSP ถูกเรียกจาก producer thread เดียวผ่าน Rust `&mut self`
     Decoder decoder_;
     Metrics metrics_;
+    // IO area เป็น memory ของ PipeWire และ callback `io_changed` publish pointer ให้ process callback
     std::atomic<spa_io_rate_match *> rate_match_{nullptr};
     std::atomic<spa_io_position *> position_{nullptr};
+    // state ต่อ consumer thread สำหรับตรวจการเปลี่ยน RateMatch และช่วง buffering
     spa_io_rate_match *active_rate_match_{nullptr};
     bool buffering_{true};
+    // state ของ queue fill controller และ clock ratio remainder
     double fill_average_seconds_{0.0};
     double rate_correction_{1.0};
     uint64_t position_remainder_{0};
     uint32_t position_rate_numerator_{0};
     uint32_t position_rate_denominator_{0};
+    // state ฝั่ง producer สำหรับวัด packet gap ใน jitter window ปัจจุบัน
     std::chrono::steady_clock::time_point last_access_unit_{};
     std::chrono::steady_clock::time_point jitter_window_started_{};
     uint64_t jitter_window_peak_gap_microseconds_{0};
+    // coefficient และ envelope ของ DSP ที่ producer thread ใช้กับ frame ถัดไป
     float gain_linear_{1.0F};
     float limit_sample_{static_cast<float>(std::numeric_limits<int16_t>::max())};
     float limiter_gain_{1.0F};
+    // lifecycle state ที่ Rust thread และ PipeWire thread ใช้ร่วมกัน
     std::atomic<bool> running_{false};
     std::mutex lifecycle_mutex_;
     pw_main_loop *main_loop_{nullptr};
@@ -789,11 +878,15 @@ class Engine final {
 
 }
 
+// concrete object หลัง opaque C handle และเป็นเจ้าของ `Engine` โดยตรง
 struct airpods_audio_engine {
+    // สร้าง Engine จาก config ที่ผ่าน C ABI
     explicit airpods_audio_engine(const airpods_audio_config &config) : value(config) {}
+    // implementation ของ decoder, DSP, queue และ PipeWire source
     Engine value;
 };
 
+// สร้าง opaque handle และแปลง C++ exception ทุกชนิดเป็น null พร้อม error buffer
 extern "C" airpods_audio_engine *airpods_audio_create(
     const airpods_audio_config *config, char *error, size_t error_size) {
     try {
@@ -810,6 +903,7 @@ extern "C" airpods_audio_engine *airpods_audio_create(
     }
 }
 
+// ทำลาย handle โดยไม่ปล่อย exception ข้าม C ABI
 extern "C" void airpods_audio_destroy(airpods_audio_engine *engine) {
     try {
         delete engine;
@@ -817,6 +911,7 @@ extern "C" void airpods_audio_destroy(airpods_audio_engine *engine) {
     }
 }
 
+// เริ่ม source และแปลง exception เป็น status ลบพร้อมข้อความ error
 extern "C" int airpods_audio_start(airpods_audio_engine *engine, char *error,
                                     size_t error_size) {
     try {
@@ -834,6 +929,7 @@ extern "C" int airpods_audio_start(airpods_audio_engine *engine, char *error,
     }
 }
 
+// หยุด source และรอ PipeWire thread จบก่อนคืน status
 extern "C" int airpods_audio_stop(airpods_audio_engine *engine, char *error,
                                    size_t error_size) {
     try {
@@ -851,6 +947,7 @@ extern "C" int airpods_audio_stop(airpods_audio_engine *engine, char *error,
     }
 }
 
+// ส่ง access unit เข้า pipeline โดยคง status 0, 1 และ 2 สำหรับ queued, full และ decode error
 extern "C" int airpods_audio_push(airpods_audio_engine *engine, const uint8_t *data,
                                    size_t size, char *error, size_t error_size) {
     try {
@@ -867,6 +964,7 @@ extern "C" int airpods_audio_push(airpods_audio_engine *engine, const uint8_t *d
     }
 }
 
+// ตรวจและใช้ DSP config ใหม่โดยไม่เปลี่ยน lifecycle ของ stream
 extern "C" int airpods_audio_set_processing(airpods_audio_engine *engine,
                                               float gain_db, float limiter_dbfs,
                                               char *error, size_t error_size) {
@@ -885,6 +983,7 @@ extern "C" int airpods_audio_set_processing(airpods_audio_engine *engine,
     }
 }
 
+// อ่านสถานะ running แบบ C integer และคืน 0 เมื่อ handle ไม่ถูกต้องหรือเกิด exception
 extern "C" int airpods_audio_is_running(const airpods_audio_engine *engine) {
     try {
         return engine != nullptr && engine->value.running() ? 1 : 0;
@@ -893,6 +992,7 @@ extern "C" int airpods_audio_is_running(const airpods_audio_engine *engine) {
     }
 }
 
+// เติม metric struct เสมอ โดยใช้ค่าศูนย์เป็น fallback ที่ปลอดภัยสำหรับ C caller
 extern "C" void airpods_audio_get_metrics(const airpods_audio_engine *engine,
                                             airpods_audio_metrics *metrics) {
     try {

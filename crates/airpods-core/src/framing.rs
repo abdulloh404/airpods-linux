@@ -1,4 +1,7 @@
 //! แยก AAC-ELD access unit ออกจาก AACP type `0x58` SDU
+//!
+//! parser ยืนยันชนิด packet และ boundary ของ access unit ทุกก้อนก่อนคืน slice
+//! ที่ยืม payload เดิม จึงไม่มีการ copy audio data ระหว่าง demux
 
 use anyhow::{Result, bail};
 
@@ -30,6 +33,7 @@ pub fn demux_audio_sdu(data: &[u8]) -> Result<Vec<&[u8]>> {
             bail!("truncated access-unit header at offset {offset}");
         }
 
+        // header ย่อยยาว 5 byte และ byte สุดท้ายกำหนดขนาด payload ของ access unit
         let length = data[offset + 4] as usize;
         let start = offset + 5;
         let end = start + length;
