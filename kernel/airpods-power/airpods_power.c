@@ -1,5 +1,9 @@
 // SPDX-License-Identifier: GPL-2.0-only
 //! สร้าง power_supply เสมือนสำหรับแบตเตอรี่ AirPods ข้างซ้ายและข้างขวา
+//!
+//! daemon เขียน payload 7 byte ผ่าน misc device แล้ว module สร้างหรือลบ battery device
+//! ตาม presence ของแต่ละข้าง โดยลบทั้งสองข้างเมื่อขาดการอัปเดตครบ 90 วินาที
+//! การอ่าน property ใช้ lock ระยะสั้น ส่วนการ register/unregister ใช้ update_lock แยก
 
 #include <linux/fs.h>
 #include <linux/err.h>
@@ -12,40 +16,65 @@
 #include <linux/uaccess.h>
 #include <linux/workqueue.h>
 
+/// รุ่น payload ที่ต้องตรงกับ byte แรกจาก daemon
 #define AIRPODS_POWER_PROTOCOL_VERSION 1
+/// เวลารอข้อมูลก่อนนำ battery device ที่อาจค้างออกจากระบบ
 #define AIRPODS_POWER_STALE_TIMEOUT_MS 90000
 
+/// รูปแบบที่เขียนครั้งเดียวต่อ update; packed ทำให้ไม่มี padding ระหว่าง field
 struct airpods_power_update {
+	/// รุ่น protocol ซึ่งปัจจุบันรับเฉพาะค่า 1
 	__u8 version;
+	/// ระบุว่ามีค่าแบตเตอรี่ซ้ายที่นำไปแสดงได้หรือไม่
 	__u8 left_present;
+	/// เปอร์เซ็นต์ซ้ายช่วง 0–100 เมื่อ present เป็นจริง
 	__u8 left_capacity;
+	/// สถานะชาร์จซ้าย โดย boolean ต้องเป็น 0 หรือ 1
 	__u8 left_charging;
+	/// ระบุว่ามีค่าแบตเตอรี่ขวาที่นำไปแสดงได้หรือไม่
 	__u8 right_present;
+	/// เปอร์เซ็นต์ขวาช่วง 0–100 เมื่อ present เป็นจริง
 	__u8 right_capacity;
+	/// สถานะชาร์จขวา โดย boolean ต้องเป็น 0 หรือ 1
 	__u8 right_charging;
 } __packed;
 
 struct airpods_power_bridge;
 
+/// สถานะหนึ่งข้างและ handle ของ power_supply ที่มีอยู่เฉพาะเมื่อ present
 struct airpods_power_cell {
+	/// กลับไปหา lock และ state ร่วมของ module
 	struct airpods_power_bridge *bridge;
+	/// handle ที่ register แล้ว หรือ NULL เมื่อไม่ได้เผยแพร่ข้างนี้
 	struct power_supply *supply;
+	/// ชื่อ model ที่ส่งผ่าน property ให้ UPower
 	const char *model;
+	/// ระบุว่าค่าจาก daemon ใช้แสดงเป็นอุปกรณ์ได้
 	bool present;
+	/// เปอร์เซ็นต์ล่าสุดที่รับมา
 	u8 capacity;
+	/// ระบุว่ากำลังชาร์จตามข้อมูลของ daemon
 	bool charging;
 };
 
+/// owner กลางสำหรับทั้งสองข้าง, write serialization และงานหมดอายุ
 struct airpods_power_bridge {
+	/// ป้องกันข้อมูลที่ property callback อ่านขณะ writer เปลี่ยนค่า
 	struct mutex lock;
+	/// จัดลำดับ writer/stale worker และการ register/unregister supply
 	struct mutex update_lock;
+	/// งานล้าง device เมื่อหมดเวลาโดยไม่มี payload ใหม่
 	struct delayed_work stale_work;
+	/// สถานะและ device ของหูฟังซ้าย
 	struct airpods_power_cell left;
+	/// สถานะและ device ของหูฟังขวา
 	struct airpods_power_cell right;
 };
 
+/// instance เดียวตลอดอายุ module; init สร้างและ exit คืนหน่วยความจำ
 static struct airpods_power_bridge *bridge;
 
+/// property ที่ module ส่งออกจริง; ไม่มีข้อมูล voltage, energy หรือแบตเตอรี่เคส
 static enum power_supply_property airpods_power_properties[] = {
 	POWER_SUPPLY_PROP_STATUS,
 	POWER_SUPPLY_PROP_PRESENT,
@@ -55,6 +84,7 @@ static enum power_supply_property airpods_power_properties[] = {
 	POWER_SUPPLY_PROP_MANUFACTURER,
 };
 
+/// อ่าน property ภายใต้ data lock และแปลง presence/charging/capacity เป็น status
 static int airpods_power_get_property(struct power_supply *supply,
 				      enum power_supply_property property,
 				      union power_supply_propval *value)
@@ -96,6 +126,7 @@ static int airpods_power_get_property(struct power_supply *supply,
 	return 0;
 }
 
+/// ชื่อ sysfs และ callback ของแบตเตอรี่ซ้าย
 static const struct power_supply_desc airpods_left_desc = {
 	.name = "airpods_left",
 	.type = POWER_SUPPLY_TYPE_BATTERY,
@@ -104,6 +135,7 @@ static const struct power_supply_desc airpods_left_desc = {
 	.get_property = airpods_power_get_property,
 };
 
+/// ชื่อ sysfs และ callback ของแบตเตอรี่ขวา
 static const struct power_supply_desc airpods_right_desc = {
 	.name = "airpods_right",
 	.type = POWER_SUPPLY_TYPE_BATTERY,
@@ -112,6 +144,7 @@ static const struct power_supply_desc airpods_right_desc = {
 	.get_property = airpods_power_get_property,
 };
 
+/// สร้าง power_supply และผูก cell ไว้ให้ property callback เรียกคืน
 static int airpods_power_register_cell(struct airpods_power_cell *cell,
 				       const struct power_supply_desc *description)
 {
@@ -127,6 +160,7 @@ static int airpods_power_register_cell(struct airpods_power_cell *cell,
 	return 0;
 }
 
+/// ถอน device ที่มีอยู่และล้าง handle เพื่อให้เรียกซ้ำได้
 static void airpods_power_unregister_cell(struct airpods_power_cell *cell)
 {
 	if (!cell->supply)
@@ -135,6 +169,7 @@ static void airpods_power_unregister_cell(struct airpods_power_cell *cell)
 	cell->supply = NULL;
 }
 
+/// ปรับการมีอยู่ของ device ตาม presence และแจ้งว่าค่า property เปลี่ยนแล้ว
 static int airpods_power_sync_cell(struct airpods_power_cell *cell,
 				   const struct power_supply_desc *description)
 {
@@ -153,11 +188,13 @@ static int airpods_power_sync_cell(struct airpods_power_cell *cell,
 	return 0;
 }
 
+/// ปฏิเสธค่า boolean ที่อยู่นอก wire format 0/1
 static bool airpods_power_valid_bool(u8 value)
 {
 	return value == 0 || value == 1;
 }
 
+/// ล้างค่าและถอนทั้งสอง device เมื่อ delayed work หมดเวลา
 static void airpods_power_mark_stale(struct work_struct *work)
 {
 	struct airpods_power_bridge *target = container_of(
@@ -172,11 +209,13 @@ static void airpods_power_mark_stale(struct work_struct *work)
 	target->right.capacity = 0;
 	target->right.charging = false;
 	mutex_unlock(&target->lock);
+	// ถอน device หลังปล่อย data lock เพราะ power_supply อาจเรียก property callback ระหว่างจัดการ device
 	airpods_power_unregister_cell(&target->left);
 	airpods_power_unregister_cell(&target->right);
 	mutex_unlock(&target->update_lock);
 }
 
+/// รับ update ครบชุด, ตรวจ payload ก่อนเปลี่ยน state แล้ว refresh เวลาอายุข้อมูล
 static ssize_t airpods_power_write(struct file *file,
 				   const char __user *buffer, size_t length,
 				   loff_t *offset)
@@ -185,6 +224,7 @@ static ssize_t airpods_power_write(struct file *file,
 	int left_result;
 	int right_result;
 
+	// รับหนึ่ง payload ต่อ write เท่านั้น; ไม่มี buffer สำหรับสะสม partial write
 	if (length != sizeof(update))
 		return -EMSGSIZE;
 	if (copy_from_user(&update, buffer, sizeof(update)))
@@ -210,10 +250,12 @@ static ssize_t airpods_power_write(struct file *file,
 	bridge->right.charging = update.right_charging;
 	mutex_unlock(&bridge->lock);
 
+	// คง update_lock ระหว่าง sync ทั้งสองข้าง แต่เปิดให้ property callback อ่าน state ได้
 	left_result = airpods_power_sync_cell(&bridge->left,
 					      &airpods_left_desc);
 	right_result = airpods_power_sync_cell(&bridge->right,
 					       &airpods_right_desc);
+	// payload ที่ยังมีข้างใดข้างหนึ่งต่ออายุ timer; ถ้าไม่มีทั้งคู่ก็ถอน device แล้วไม่ต้องรอ stale
 	if (update.left_present || update.right_present)
 		mod_delayed_work(system_wq, &bridge->stale_work,
 			msecs_to_jiffies(AIRPODS_POWER_STALE_TIMEOUT_MS));
@@ -221,6 +263,7 @@ static ssize_t airpods_power_write(struct file *file,
 		cancel_delayed_work(&bridge->stale_work);
 	mutex_unlock(&bridge->update_lock);
 
+	// state ถูกอัปเดตแล้วแม้การ register บางข้างล้มเหลว; คืน error ให้ daemon รู้ผล write
 	if (left_result)
 		return left_result;
 	if (right_result)
@@ -228,12 +271,14 @@ static ssize_t airpods_power_write(struct file *file,
 	return sizeof(update);
 }
 
+/// เปิดเฉพาะ write และปิด seek; module owner ป้องกัน unload ขณะยังมี file reference
 static const struct file_operations airpods_power_fops = {
 	.owner = THIS_MODULE,
 	.write = airpods_power_write,
 	.llseek = no_llseek,
 };
 
+/// จุดรับข้อมูลจาก user session; udev จัดสิทธิ์เข้าถึงเพิ่มเติมด้วย uaccess
 static struct miscdevice airpods_power_miscdev = {
 	.minor = MISC_DYNAMIC_MINOR,
 	.name = "airpods_power",
@@ -241,6 +286,7 @@ static struct miscdevice airpods_power_miscdev = {
 	.mode = 0660,
 };
 
+/// จอง owner/locks/work และเปิด misc device โดยยังไม่สร้าง battery device จนมีข้อมูล
 static int __init airpods_power_init(void)
 {
 	int result;
@@ -270,6 +316,7 @@ free_bridge:
 	return result;
 }
 
+/// รอ stale worker จบ, ถอน misc/battery devices แล้วคืน owner เพื่อไม่ให้ callback ใช้ pointer ที่หมดอายุ
 static void __exit airpods_power_exit(void)
 {
 	cancel_delayed_work_sync(&bridge->stale_work);
