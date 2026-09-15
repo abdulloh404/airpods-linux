@@ -1,4 +1,7 @@
-//! ส่งค่าแบตเตอรี่ไปยัง kernel bridge เมื่อ `/dev/airpods_power` พร้อมใช้งาน
+//! แปลงสถานะแบตเตอรี่เป็น binary protocol ของ kernel power bridge
+//!
+//! การเปิด `/dev/airpods_power` ใหม่ทุกครั้งทำให้ daemon รองรับ module ที่ถูกโหลดหรือถอดระหว่างทำงาน
+//! และรายงานความพร้อมของ bridge กลับไปยัง runtime state ได้จากผลของแต่ละ update
 
 use std::io;
 use std::path::PathBuf;
@@ -6,17 +9,24 @@ use std::path::PathBuf;
 use airpods_ipc::BatteryStatus;
 use tokio::io::AsyncWriteExt;
 
+/// ผลการส่งข้อมูลที่แยกกรณีเขียนสำเร็จออกจากกรณี kernel bridge ยังไม่พร้อม
 pub enum UpdateOutcome {
+    /// เขียน payload ครบลง device node แล้ว
     Written,
+    /// ไม่พบ device node จึงไม่มีข้อมูลถูกส่ง
     Missing,
 }
 
 #[derive(Debug, Clone)]
+/// ตัวส่งสถานะแบตเตอรี่ไปยัง device node ของ kernel module
 pub struct PowerBridge {
+    /// path ของ device node ที่เปิดใหม่ในแต่ละ update
     path: PathBuf,
 }
 
+/// ใช้ device node มาตรฐานที่ kernel module ของโปรเจกต์สร้าง
 impl Default for PowerBridge {
+    /// สร้าง bridge ที่ชี้ไปยัง `/dev/airpods_power`
     fn default() -> Self {
         Self {
             path: PathBuf::from("/dev/airpods_power"),
@@ -30,6 +40,7 @@ impl PowerBridge {
         self.update(BatteryStatus::unavailable()).await
     }
 
+    /// เข้ารหัสสถานะ left และ right เป็น payload 7 bytes แล้วเขียนไปยัง kernel bridge
     pub async fn update(&self, battery: BatteryStatus) -> io::Result<UpdateOutcome> {
         let mut device = match tokio::fs::OpenOptions::new().write(true).open(&self.path).await {
             Ok(device) => device,
@@ -38,6 +49,7 @@ impl PowerBridge {
             }
             Err(error) => return Err(error),
         };
+        // byte แรกคือ protocol version ตามด้วย available, percent และ charging ของแต่ละข้าง
         let payload = [
             1,
             u8::from(battery.left_percent >= 0),
@@ -52,6 +64,7 @@ impl PowerBridge {
     }
 }
 
+/// จำกัด percent ให้อยู่ในช่วงที่ protocol แบบ `u8` รองรับ
 fn percent_byte(percent: i16) -> u8 {
     percent.clamp(0, 100) as u8
 }

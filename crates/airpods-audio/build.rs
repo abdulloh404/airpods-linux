@@ -1,5 +1,11 @@
+//! สร้าง native audio engine และกำหนด library ที่ Rust ต้อง link
+//!
+//! build script compile FDK-AAC แบบ static จาก vendored source แล้วค้นหา PipeWire
+//! ผ่าน pkg-config ก่อนใช้ C++20 compile `audio_engine.cpp`
+
 use std::{env, path::PathBuf};
 
+/// เตรียม FDK-AAC, PipeWire และ C++ bridge พร้อมประกาศเงื่อนไข rebuild ให้ Cargo
 fn main() {
     let manifest_dir = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").unwrap());
     let repository_root = manifest_dir.join("../..");
@@ -11,12 +17,14 @@ fn main() {
         );
     }
 
+    // ปิด executable และ metadata ที่ไม่ใช้ เพื่อติดตั้งเฉพาะ static library กับ header
     let fdk_install = cmake::Config::new(&fdk_source)
         .define("BUILD_SHARED_LIBS", "OFF")
         .define("BUILD_PROGRAMS", "OFF")
         .define("FDK_AAC_INSTALL_CMAKE_CONFIG_MODULE", "OFF")
         .define("FDK_AAC_INSTALL_PKGCONFIG_MODULE", "OFF")
         .build();
+    // ขอ PipeWire API ขั้นต่ำที่ native engine ใช้และจัดการ link metadata เองด้านล่าง
     let mut pipewire_config = pkg_config::Config::new();
     pipewire_config
         .atleast_version("1.6.8")
@@ -25,6 +33,7 @@ fn main() {
         .probe("libpipewire-0.3")
         .expect("PipeWire 1.6.8 or newer development files are required");
 
+    // compile translation unit เดียวพร้อม include path จาก FDK-AAC และ PipeWire ที่ตรวจพบ
     let mut native = cc::Build::new();
     native
         .cpp(true)
@@ -39,6 +48,7 @@ fn main() {
     }
     native.compile("airpods_audio_native");
 
+    // CMake อาจติดตั้ง library ลง `lib64` หรือ `lib` ตาม platform
     let fdk_lib = if fdk_install.join("lib64").is_dir() {
         fdk_install.join("lib64")
     } else {

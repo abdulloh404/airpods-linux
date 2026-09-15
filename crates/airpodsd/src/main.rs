@@ -1,4 +1,7 @@
-//! รัน daemon หลักซึ่งเป็นเจ้าของ BlueZ, AACP, audio engine และ battery bridge
+//! ประกอบและรัน daemon ซึ่งเป็นเจ้าของ BlueZ, AACP, audio engine และ battery bridge
+//!
+//! entrypoint โหลด config, เปิด session D-Bus, สร้าง channel สำหรับสื่อสารระหว่าง service กับ workers
+//! แล้วรอ signal ปิดระบบ ก่อนส่ง shutdown และรอให้ audio, inventory และ battery lifecycle จบตามลำดับ
 
 mod audio;
 mod bluez;
@@ -17,6 +20,7 @@ use tokio::sync::{RwLock, mpsc, watch};
 use airpods_ipc::{BUS_NAME, MANAGER_INTERFACE, OBJECT_PATH};
 
 #[tokio::main]
+/// เริ่มส่วนประกอบทั้งหมดของ daemon และปิดงานที่ถือ resource เมื่อได้รับ shutdown signal
 async fn main() -> Result<()> {
     let config_store = config::ConfigStore::from_xdg()?;
     let (config, config_error) = match config_store.load() {
@@ -38,6 +42,7 @@ async fn main() -> Result<()> {
     let (aacp_battery_tx, aacp_battery_rx) = mpsc::unbounded_channel();
     let (device_connected_tx, device_connected_rx) = watch::channel(None);
 
+    // D-Bus service แก้ config และส่ง desired state โดยไม่ถือ hardware resource เอง
     let service = ManagerService::new(
         state.clone(),
         config,
@@ -52,6 +57,7 @@ async fn main() -> Result<()> {
         .build()
         .await?;
 
+    // แต่ละ worker รับ channel เฉพาะหน้าที่และแชร์ runtime snapshot ผ่าน RwLock
     let event_task = tokio::spawn(emit_events(connection.clone(), event_rx));
     let audio_task = tokio::spawn(audio::lifecycle_loop(
         state.clone(),
@@ -77,17 +83,20 @@ async fn main() -> Result<()> {
     ));
 
     wait_for_shutdown().await?;
+    // ปิดความต้องการ microphone ก่อนประกาศ shutdown เพื่อให้ audio lifecycle เริ่ม cleanup ทันที
     desired_tx.send_modify(|desired| desired.enabled = false);
     shutdown_tx.send_replace(true);
 
     let _ = audio_task.await;
     let _ = inventory_task.await;
     let _ = battery_task.await;
+    // ปล่อย D-Bus connection ก่อนยกเลิก event forwarder ที่อาจกำลังรอ event ถัดไป
     drop(connection);
     event_task.abort();
     Ok(())
 }
 
+/// แปลง internal event เป็น D-Bus signal สำหรับ client ที่ subscribe อยู่
 async fn emit_events(connection: zbus::Connection, mut events: mpsc::UnboundedReceiver<Event>) {
     while let Some(event) = events.recv().await {
         let result = match event {
@@ -132,6 +141,7 @@ async fn emit_events(connection: zbus::Connection, mut events: mpsc::UnboundedRe
 }
 
 #[cfg(unix)]
+/// รอ Ctrl-C หรือ SIGTERM เพื่อให้ systemd และ interactive shell ปิด daemon ผ่าน flow เดียวกัน
 async fn wait_for_shutdown() -> Result<()> {
     let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     tokio::select! {
@@ -142,6 +152,7 @@ async fn wait_for_shutdown() -> Result<()> {
 }
 
 #[cfg(not(unix))]
+/// รอ Ctrl-C บน platform ที่ไม่มี Unix signal API
 async fn wait_for_shutdown() -> Result<()> {
     tokio::signal::ctrl_c().await?;
     Ok(())

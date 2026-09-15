@@ -1,4 +1,7 @@
-//! เริ่ม GTK application และบังคับใช้ X11 backend ก่อนเปิด display
+//! เริ่ม GTK application และเตรียม style ก่อนสร้างหน้าต่างหลัก
+//!
+//! GTK ถูกจำกัดให้ใช้ X11 backend ตั้งแต่ก่อนสร้าง `Application` เพื่อให้ GUI
+//! ทำงานผ่าน X11 หรือ XWayland ตามข้อกำหนดของ application นี้
 
 mod ipc_client;
 mod ui;
@@ -6,9 +9,12 @@ mod ui;
 use gtk::prelude::*;
 use gtk4 as gtk;
 
+/// application ID ที่ GTK ใช้ระบุ instance และผูกกับ desktop integration
 const APP_ID: &str = "io.github.abdulloh404.AirPods.Gui";
 
+/// ตั้งค่า GTK lifecycle แล้วมอบการสร้าง UI ให้ module `ui`
 fn main() {
+    // ต้องจำกัด backend ก่อน GTK เปิด display มิฉะนั้นค่าจะไม่มีผลกับ instance นี้
     gtk::gdk::set_allowed_backends("x11");
 
     let app = gtk::Application::builder().application_id(APP_ID).build();
@@ -17,10 +23,12 @@ fn main() {
     app.run();
 }
 
+/// โหลด stylesheet ที่ฝังใน binary และติดตั้งให้ display ปัจจุบัน
 fn install_css() {
     let provider = gtk::CssProvider::new();
     provider.load_from_data(include_str!("style.css"));
 
+    // startup อาจเกิดขึ้นโดยยังไม่มี display; กรณีนี้ปล่อยให้ GTK ใช้ style เริ่มต้น
     let Some(display) = gtk::gdk::Display::default() else {
         return;
     };
