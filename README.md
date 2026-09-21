@@ -61,7 +61,7 @@ configuration files or manage systemd services directly.
   additional compiler requirements.
 - A C++20 compiler, CMake, Make, and pkg-config.
 - GTK4 development files supporting GTK 4.6 or later.
-- PipeWire development files providing `libpipewire-0.3 >= 1.6.8`.
+- PipeWire development files providing `libpipewire-0.3 >= 0.3.48`.
 - D-Bus development files required by the BlueZ integration.
 - Build headers for the running Linux kernel, available under
   `/lib/modules/$(uname -r)/build`.
@@ -73,8 +73,10 @@ A separate system installation of FDK-AAC is not required.
 
 - BlueZ and a Bluetooth adapter supporting the BR/EDR connection and BLE scanning
   used by this implementation.
-- PipeWire, a session manager such as WirePlumber, and a PulseAudio-compatible
-  server such as `pipewire-pulse` for the `pactl` operations.
+- PipeWire 0.3.48 or newer, WirePlumber 0.4.8 or newer, and a
+  PulseAudio-compatible server such as `pipewire-pulse` for the `pactl`
+  operations. The current compatibility target includes PipeWire 1.6.9 and
+  WirePlumber 0.5.17.
 - `pactl` on the daemon's `PATH`.
 - An active user session with a session D-Bus and systemd user manager.
 - GTK4 and an X11 display, or XWayland when running a Wayland session.
@@ -104,25 +106,18 @@ There is currently no Debian packaging or DKMS integration in this repository.
 
 ### PipeWire build and runtime paths
 
-The Makefile locates `pipewire` on `PATH`, derives its installation prefix,
-and prepends `<prefix>/lib/pkgconfig` to the build's `PKG_CONFIG_PATH`.
-`PIPEWIRE_EXECUTABLE` and `PIPEWIRE_PREFIX` can be overridden as Make variables.
-Both Rust build scripts require PipeWire development files at least version 1.6.8.
-The daemon build script also passes the discovered library directories to the
-linker as runtime search paths.
+The build discovers `libpipewire-0.3` through `pkg-config` and requires version
+0.3.48 or newer. It does not force a PipeWire installation prefix or embed a
+custom runtime search path, so a normal build uses the distribution's default
+development files and runtime libraries. To build against a separate PipeWire
+installation, set `PKG_CONFIG_PATH` explicitly before running `make build` and
+configure the runtime library path outside this project.
 
-The supplied [systemd unit](systemd/airpodsd.service) separately sets these
-runtime environment variables:
-
-```ini
-LD_LIBRARY_PATH=/opt/pipewire-1.6.8/lib
-PIPEWIRE_MODULE_DIR=/opt/pipewire-1.6.8/lib/pipewire-0.3
-SPA_PLUGIN_DIR=/opt/pipewire-1.6.8/lib/spa-0.2
-```
-
-These service paths are fixed in the current source. If your PipeWire installation
-uses another location, review and adapt the service environment before installation.
-Selecting a different build prefix does not update the service unit automatically.
+The project uses PipeWire's stable 0.3 client API and does not link directly to
+libwireplumber. WirePlumber supplies session management at runtime through the
+standard PipeWire graph, allowing the same code to operate with the Ubuntu 22.04
+defaults (PipeWire 0.3.48 and WirePlumber 0.4.8) and the currently verified
+versions (PipeWire 1.6.9 and WirePlumber 0.5.17).
 
 ## Installation
 

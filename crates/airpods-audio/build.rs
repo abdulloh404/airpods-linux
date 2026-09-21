@@ -26,10 +26,12 @@ fn main() {
         .build();
     // ขอ PipeWire API ขั้นต่ำที่ native engine ใช้และจัดการ link metadata เองด้านล่าง
     let mut pipewire_config = pkg_config::Config::new();
-    pipewire_config.atleast_version("0.3").cargo_metadata(false);
+    pipewire_config
+        .atleast_version("0.3.48")
+        .cargo_metadata(false);
     let pipewire = pipewire_config
         .probe("libpipewire-0.3")
-        .expect("PipeWire development files are required (Ubuntu: libpipewire-0.3-dev)");
+        .expect("PipeWire 0.3.48 or newer development files are required (Ubuntu: libpipewire-0.3-dev)");
 
     // compile translation unit เดียวพร้อม include path จาก FDK-AAC และ PipeWire ที่ตรวจพบ
     let mut native = cc::Build::new();
