@@ -131,8 +131,9 @@ The installer resolves the target user from `SUDO_USER` and checks for an active
 session bus. It then:
 
 1. Installs the daemon, CLI, and GUI in `/usr/local/bin`.
-2. Installs the user service in `/usr/local/lib/systemd/user` and the desktop
-   launcher in `/usr/local/share/applications`.
+2. Installs the user service in `/usr/local/systemd/user`, enables it from that
+   absolute path, and installs the desktop launcher in
+   `/usr/local/share/applications`.
 3. Installs the kernel module in `/lib/modules/<kernel-release>/extra`.
 4. Installs the udev rule and module autoload configuration in `/etc/udev/rules.d`
    and `/etc/modules-load.d`.

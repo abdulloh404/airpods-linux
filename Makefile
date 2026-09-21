@@ -1,5 +1,5 @@
 BIN_DIR := /usr/local/bin
-SYSTEMD_USER_DIR := /usr/local/lib/systemd/user
+SYSTEMD_USER_DIR := /usr/local/systemd/user
 APPLICATIONS_DIR := /usr/local/share/applications
 UDEV_RULES_DIR := /etc/udev/rules.d
 MODULES_LOAD_DIR := /etc/modules-load.d
