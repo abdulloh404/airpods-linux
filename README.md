@@ -12,10 +12,10 @@ The CLI and GTK4 application communicate with it over the session D-Bus.
   signed 16-bit PipeWire virtual source.
 - Adjust microphone gain and limiter settings while streaming.
 - Send Off, Noise Cancellation, Transparency, and Adaptive listening-mode commands.
-- Read left and right battery levels and charging state from AACP notifications,
-  with BLE advertisements as a fallback.
-- Expose separate left and right batteries to UPower through the optional
-  `airpods_power` kernel module.
+- Read left, right, and charging-case battery levels from AACP notifications,
+  with BLE advertisements as a fallback and last-known retention for a closed case.
+- Expose separate left, right, and charging-case batteries to UPower through the
+  optional `airpods_power` kernel module.
 - Save user settings and retry failed AACP/audio sessions with backoff.
 
 Pair and connect the AirPods using the system's Bluetooth controls first.
@@ -33,7 +33,7 @@ on the AirPods model and firmware.
 | `airpods-ipc` | Shared D-Bus contract, payload types, and control limits | [IPC contract](crates/airpods-ipc/src/lib.rs) |
 | `airpods-core` | AACP transport, audio framing, and AACP/BLE battery parsing | [Core modules](crates/airpods-core/src/lib.rs) |
 | `airpods-audio` | Rust interface to the C++ AAC-ELD decoder, DSP, queue, and PipeWire engine | [Rust interface](crates/airpods-audio/src/lib.rs), [C++ engine](crates/airpods-audio/native/audio_engine.cpp) |
-| `airpods-power` | Kernel `power_supply` bridge for separate earbud batteries | [Kernel module](kernel/airpods-power/airpods_power.c) |
+| `airpods-power` | Kernel `power_supply` bridge for separate earbud and case batteries | [Kernel module](kernel/airpods-power/airpods_power.c) |
 
 The audio path is:
 
@@ -190,7 +190,7 @@ and do not change with the selected device's name.
 | `airpodsctl mic status` | Show microphone state and reconnect-attempt information |
 | `airpodsctl mic gain <DB>` | Set pre-limiter gain from 0 to 30 dB |
 | `airpodsctl mic limiter -- <DBFS>` | Set the limiter ceiling from -12 to 0 dBFS |
-| `airpodsctl battery` | Show left/right percentages and charging state |
+| `airpodsctl battery` | Show left/right/case percentages, charging state, and last-known case status |
 
 For example:
 
@@ -224,7 +224,7 @@ airpods-gui
 ```
 
 The application provides device selection, a microphone switch, gain and limiter
-controls, left/right battery indicators, daemon state, bridge availability, and
+controls, left/right/case battery indicators, daemon state, bridge availability, and
 error messages. Listening modes are currently available through the CLI and D-Bus.
 
 The GUI runs GTK on the main thread and D-Bus operations on a separate Tokio worker.
@@ -306,17 +306,21 @@ connected, the battery worker performs BLE fallback scans on connection and
 approximately every 30 seconds. A scan waits up to 10 seconds for a supported
 advertisement. BLE percentages have 10% resolution.
 
-Battery data is invalidated when the selected device is reported disconnected
-or after two consecutive fallback scan failures. While using AACP data, the
-worker republishes its cached values to the kernel bridge every 30 seconds;
-this refreshes the bridge's timeout without proving a new measurement arrived.
+Left and right data is invalidated when the selected device is reported
+disconnected or after two consecutive fallback scan failures. The most recent
+case percentage is retained while the closed case stops transmitting and is
+marked last known after 90 seconds, an explicit unavailable report, or a device
+disconnect. Selecting another AirPods device clears that cache. The worker
+republishes cached values to the kernel bridge every 30 seconds; this refreshes
+the bridge's timeout without proving a new measurement arrived.
 
-The optional bridge receives seven-byte updates on `/dev/airpods_power` and
-registers `airpods_left` and `airpods_right` under `/sys/class/power_supply`
-when values are available. It removes absent devices and clears both devices
-if updates stop for 90 seconds. The daemon also invalidates the bridge during
-normal shutdown. The supplied udev rule uses mode `0660` and `uaccess` for access
-from the active user session.
+The optional bridge receives protocol-version-2 updates on `/dev/airpods_power`
+and registers `airpods_left`, `airpods_right`, and `airpods_case` under
+`/sys/class/power_supply` when values are available. A last-known case reports
+`Unknown` status while retaining its percentage. The bridge removes absent
+devices and clears all three devices if updates stop for 90 seconds. The daemon
+also invalidates the bridge during normal shutdown. The supplied udev rule uses
+mode `0660` and `uaccess` for access from the active user session.
 
 Without the module, microphone operation and CLI/GUI battery reporting remain
 available. The status field for bridge availability reflects access to the bridge;
@@ -332,8 +336,8 @@ it does not confirm that UPower has already displayed the devices.
 - BLE fallback accepts the first supported advertisement and does not correlate
   it with the selected device's address. Nearby AirPods can therefore produce
   battery readings for another pair.
-- The core parsers understand case battery values, but D-Bus, the GUI, and the
-  kernel bridge currently expose only left and right earbuds.
+- A closed case may stop transmitting battery data. Its retained percentage is
+  explicitly last known and may differ from the current physical charge level.
 - The decoder configuration and virtual-source format are fixed. Recognition by
   the battery parser does not guarantee microphone or listening-mode support.
 

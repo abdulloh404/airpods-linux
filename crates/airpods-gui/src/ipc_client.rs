@@ -36,7 +36,7 @@ pub enum Event {
         status: DaemonStatus,
         /// รายการ AirPods ที่ BlueZ รู้จัก
         devices: Vec<DeviceInfo>,
-        /// ค่าแบตเตอรี่ล่าสุดของ AirPods ทั้งสองข้าง
+        /// ค่าแบตเตอรี่ล่าสุดของ AirPods ทั้งสองข้างและเคสชาร์จ
         battery: BatteryStatus,
     },
     /// status update ที่มาจาก D-Bus signal

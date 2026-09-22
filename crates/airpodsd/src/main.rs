@@ -40,7 +40,8 @@ async fn main() -> Result<()> {
     let (event_tx, event_rx) = mpsc::unbounded_channel();
     let (mode_tx, mode_rx) = mpsc::channel(8);
     let (aacp_battery_tx, aacp_battery_rx) = mpsc::unbounded_channel();
-    let (device_connected_tx, device_connected_rx) = watch::channel(None);
+    let (device_connection_tx, device_connection_rx) =
+        watch::channel(None::<workers::SelectedDeviceConnection>);
 
     // D-Bus service แก้ config และส่ง desired state โดยไม่ถือ hardware resource เอง
     let service = ManagerService::new(
@@ -70,7 +71,7 @@ async fn main() -> Result<()> {
     let inventory_task = tokio::spawn(workers::inventory_loop(
         state.clone(),
         event_tx.clone(),
-        device_connected_tx,
+        device_connection_tx,
         shutdown_rx.clone(),
     ));
     let battery_task = tokio::spawn(workers::battery_loop(
@@ -78,7 +79,7 @@ async fn main() -> Result<()> {
         event_tx,
         power::PowerBridge::default(),
         aacp_battery_rx,
-        device_connected_rx,
+        device_connection_rx,
         shutdown_rx,
     ));
 

@@ -47,8 +47,8 @@ enum Command {
         #[command(subcommand)]
         command: ModeCommand,
     },
-    /// แสดงค่าแบตเตอรี่ล่าสุดของ AirPods ทั้งสองข้าง
-    #[command(about = "Show left and right battery values", long_about = None)]
+    /// แสดงค่าแบตเตอรี่ล่าสุดของ AirPods ทั้งสองข้างและเคสชาร์จ
+    #[command(about = "Show left, right and case battery values", long_about = None)]
     Battery,
 }
 
@@ -232,7 +232,7 @@ fn print_mic_status(status: &DaemonStatus) {
     }
 }
 
-/// พิมพ์แบตเตอรี่สองข้างด้วยรูปแบบเดียวกัน รวมเครื่องหมายชาร์จเมื่อมีข้อมูล
+/// พิมพ์แบตเตอรี่ทั้งสองข้างและค่าเคสล่าสุดที่อาจเป็นข้อมูลจาก cache
 fn print_battery(battery: BatteryStatus) {
     println!(
         "Left: {}{}",
@@ -243,6 +243,16 @@ fn print_battery(battery: BatteryStatus) {
         "Right: {}{}",
         percent(battery.right_percent),
         charging(battery.right_charging)
+    );
+    println!(
+        "Case: {}{}{}",
+        percent(battery.case_percent),
+        charging(battery.case_charging && !battery.case_stale),
+        if battery.case_percent >= 0 && battery.case_stale {
+            " (last known)"
+        } else {
+            ""
+        }
     );
 }
 

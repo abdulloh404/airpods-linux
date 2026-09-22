@@ -4,7 +4,7 @@
 //! ส่วน battery worker ให้ข้อมูล AACP จาก microphone session มีความสำคัญสูงกว่า BLE scan และเขียนผลเดียวกัน
 //! ไปยัง shared state, D-Bus event channel และ kernel power bridge
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use airpods_core::{
     AirPodsBattery, BatteryLevel,
@@ -21,11 +21,33 @@ use crate::service::{Event, SharedState};
 const BATTERY_FAILURES_BEFORE_INVALIDATION: u8 = 2;
 /// รอบส่งข้อมูลซ้ำไปยัง kernel bridge และเริ่ม fallback scan เมื่อไม่มี AACP data
 const BATTERY_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
+/// อายุสูงสุดที่ถือว่าค่าเคสยังสดเมื่อไม่ได้รับ component นี้ซ้ำ
+const CASE_FRESH_TIMEOUT: Duration = Duration::from_secs(90);
+
+/// connection snapshot ของอุปกรณ์ที่เลือก ใช้แยกการหลุดชั่วคราวออกจากการเปลี่ยนอุปกรณ์
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct SelectedDeviceConnection {
+    /// Bluetooth address ของอุปกรณ์ที่เลือก
+    address: String,
+    /// สถานะ connection ล่าสุดจาก BlueZ
+    connected: bool,
+}
+
+/// ค่าเคสล่าสุดพร้อมเวลาที่ได้รับข้อมูลจริงจาก AACP หรือ BLE
+#[derive(Clone, Copy, Debug)]
+struct CachedCase {
+    /// เปอร์เซ็นต์ล่าสุดที่เคยได้รับ
+    percent: i16,
+    /// สถานะชาร์จที่มากับเปอร์เซ็นต์ล่าสุด
+    charging: bool,
+    /// เวลา monotonic ที่ได้รับค่าจริง ไม่รวมการ publish cache ซ้ำ
+    observed_at: Instant,
+}
 
 /// การเปลี่ยนแหล่งข้อมูลแบตเตอรี่จาก AACP session ของ microphone
 #[derive(Clone, Copy, Debug)]
 pub enum AacpBatteryEvent {
-    /// battery notification ที่อาจมีข้อมูลเพียงข้างเดียวจาก AACP session
+    /// battery notification ที่อาจมีข้อมูลเพียง component เดียวจาก AACP session
     Update(AacpBatteryUpdate),
     /// แจ้งว่า AACP session สิ้นสุดและต้องกลับไปใช้ BLE scan หาก device ยังเชื่อมอยู่
     SessionEnded,
@@ -35,7 +57,7 @@ pub enum AacpBatteryEvent {
 pub async fn inventory_loop(
     state: SharedState,
     events: mpsc::UnboundedSender<Event>,
-    device_connected: watch::Sender<Option<bool>>,
+    device_connection: watch::Sender<Option<SelectedDeviceConnection>>,
     mut shutdown: watch::Receiver<bool>,
 ) {
     loop {
@@ -46,8 +68,12 @@ pub async fn inventory_loop(
             let selected_connected = devices
                 .iter()
                 .any(|device| device.selected && device.connected);
-            if *device_connected.borrow() != Some(selected_connected) {
-                let _ = device_connected.send(Some(selected_connected));
+            let connection = SelectedDeviceConnection {
+                address: selected.clone(),
+                connected: selected_connected,
+            };
+            if device_connection.borrow().as_ref() != Some(&connection) {
+                let _ = device_connection.send(Some(connection));
             }
             // เปรียบเทียบและแทน snapshot ภายใต้ write lock เดียว แต่ส่ง event หลังปล่อย lock
             let changed = {
@@ -81,15 +107,17 @@ pub async fn battery_loop(
     events: mpsc::UnboundedSender<Event>,
     bridge: PowerBridge,
     mut aacp_events: mpsc::UnboundedReceiver<AacpBatteryEvent>,
-    mut device_connected: watch::Receiver<Option<bool>>,
+    mut device_connection: watch::Receiver<Option<SelectedDeviceConnection>>,
     mut shutdown: watch::Receiver<bool>,
 ) {
     // `precise_battery` ระบุว่า AACP เป็นแหล่งหลักอยู่ จึงใช้กั้นผล BLE scan ที่มาถึงภายหลัง
     let mut consecutive_failures = 0_u8;
     let mut precise_battery = None;
-    let mut is_device_connected = *device_connected.borrow_and_update();
+    let mut selected_connection = device_connection.borrow_and_update().clone();
+    let mut cached_case = None;
     let mut aacp_events_open = true;
     let mut scan_in_progress = false;
+    let mut scan_generation = 0_u64;
     let (scan_results_tx, mut scan_results_rx) = mpsc::unbounded_channel();
     let mut refresh = tokio::time::interval(BATTERY_REFRESH_INTERVAL);
     // ข้าม tick ที่สะสมเมื่อ task ช้า เพื่อไม่ยิง scan หลายงานติดกันหลังกลับมาทำงาน
@@ -104,21 +132,31 @@ pub async fn battery_loop(
                     break;
                 }
             }
-            changed = device_connected.changed() => {
+            changed = device_connection.changed() => {
                 if changed.is_err() {
-                    is_device_connected = Some(false);
+                    selected_connection = None;
                 } else {
-                    let next = *device_connected.borrow_and_update();
-                    if next == is_device_connected {
+                    let next = device_connection.borrow_and_update().clone();
+                    if next == selected_connection {
                         continue;
                     }
-                    is_device_connected = next;
+                    let target_changed = selected_address(&next) != selected_address(&selected_connection);
+                    selected_connection = next;
+                    if target_changed {
+                        // invalidate scan และ cache ของอุปกรณ์เดิมก่อนเริ่มอ่านเป้าหมายใหม่
+                        scan_generation = scan_generation.wrapping_add(1);
+                        scan_in_progress = false;
+                        precise_battery = None;
+                        cached_case = None;
+                        consecutive_failures = 0;
+                    }
                 }
 
-                if is_device_connected == Some(true) {
+                if selected_connected(&selected_connection) == Some(true) {
                     if precise_battery.is_none() && !scan_in_progress {
                         // เริ่ม fallback scan เพียงงานเดียวจนกว่าจะได้รับผลกลับทาง channel
-                        spawn_battery_scan(&scan_results_tx);
+                        scan_generation = scan_generation.wrapping_add(1);
+                        spawn_battery_scan(&scan_results_tx, scan_generation);
                         scan_in_progress = true;
                     }
                 } else {
@@ -128,7 +166,7 @@ pub async fn battery_loop(
                         &state,
                         &events,
                         &bridge,
-                        BatteryStatus::unavailable(),
+                        cached_case_status(cached_case, true),
                     )
                     .await;
                 }
@@ -136,16 +174,19 @@ pub async fn battery_loop(
             event = aacp_events.recv(), if aacp_events_open => {
                 match event {
                     Some(AacpBatteryEvent::Update(update)) => {
-                        if is_device_connected == Some(false) {
+                        if selected_connected(&selected_connection) == Some(false) {
                             continue;
                         }
-                        if update.left.is_none() && update.right.is_none() {
-                            continue;
+                        if let Some(connection) = selected_connection.as_mut() {
+                            connection.connected = true;
                         }
-                        is_device_connected = Some(true);
-                        // notification อาจอัปเดตข้างเดียว จึงรวมกับ snapshot AACP ก่อนหน้า
-                        let mut battery = precise_battery.unwrap_or_else(BatteryStatus::unavailable);
-                        apply_aacp_update(&mut battery, update);
+                        // notification อาจอัปเดต component เดียว จึงเริ่มจาก snapshot ปัจจุบัน
+                        let mut battery = match precise_battery {
+                            Some(battery) => battery,
+                            None => state.read().await.battery,
+                        };
+                        apply_aacp_update(&mut battery, update, &mut cached_case);
+                        refresh_case_freshness(&mut battery, cached_case);
                         precise_battery = Some(battery);
                         consecutive_failures = 0;
                         publish_battery(&state, &events, &bridge, battery).await;
@@ -154,15 +195,16 @@ pub async fn battery_loop(
                         // หลัง microphone หยุด ข้อมูล AACP ไม่ถือว่าสดและต้องหา snapshot จาก BLE ใหม่
                         precise_battery = None;
                         consecutive_failures = 0;
-                        if is_device_connected == Some(true) && !scan_in_progress {
-                            spawn_battery_scan(&scan_results_tx);
+                        if selected_connected(&selected_connection) == Some(true) && !scan_in_progress {
+                            scan_generation = scan_generation.wrapping_add(1);
+                            spawn_battery_scan(&scan_results_tx, scan_generation);
                             scan_in_progress = true;
-                        } else if is_device_connected != Some(true) {
+                        } else if selected_connected(&selected_connection) != Some(true) {
                             publish_battery(
                                 &state,
                                 &events,
                                 &bridge,
-                                BatteryStatus::unavailable(),
+                                cached_case_status(cached_case, true),
                             )
                             .await;
                         }
@@ -171,31 +213,36 @@ pub async fn battery_loop(
                         // channel ปิดถาวร จึงปิด branch นี้และคง fallback BLE flow ต่อไป
                         aacp_events_open = false;
                         precise_battery = None;
-                        if is_device_connected == Some(true) && !scan_in_progress {
-                            spawn_battery_scan(&scan_results_tx);
+                        if selected_connected(&selected_connection) == Some(true) && !scan_in_progress {
+                            scan_generation = scan_generation.wrapping_add(1);
+                            spawn_battery_scan(&scan_results_tx, scan_generation);
                             scan_in_progress = true;
-                        } else if is_device_connected != Some(true) {
+                        } else if selected_connected(&selected_connection) != Some(true) {
                             publish_battery(
                                 &state,
                                 &events,
                                 &bridge,
-                                BatteryStatus::unavailable(),
+                                cached_case_status(cached_case, true),
                             )
                             .await;
                         }
                     }
                 }
             }
-            Some(scan) = scan_results_rx.recv(), if scan_in_progress => {
+            Some((generation, scan)) = scan_results_rx.recv() => {
+                if generation != scan_generation {
+                    continue;
+                }
                 scan_in_progress = false;
                 // ทิ้งผล scan ที่เก่าแล้วหาก AACP ส่งข้อมูลใหม่หรือ device หลุดระหว่างรอ
-                if precise_battery.is_some() || is_device_connected != Some(true) {
+                if precise_battery.is_some() || selected_connected(&selected_connection) != Some(true) {
                     continue;
                 }
                 match scan {
                     Ok(battery) => {
                         consecutive_failures = 0;
-                        publish_battery(&state, &events, &bridge, battery_status(battery)).await;
+                        let battery = battery_status(battery, &mut cached_case);
+                        publish_battery(&state, &events, &bridge, battery).await;
                     }
                     Err(_) => {
                         consecutive_failures = consecutive_failures.saturating_add(1);
@@ -205,7 +252,7 @@ pub async fn battery_loop(
                                 &state,
                                 &events,
                                 &bridge,
-                                BatteryStatus::unavailable(),
+                                cached_case_status(cached_case, true),
                             )
                             .await;
                         }
@@ -213,12 +260,24 @@ pub async fn battery_loop(
                 }
             }
             _ = refresh.tick() => {
-                if let Some(battery) = precise_battery {
+                if let Some(mut battery) = precise_battery {
+                    refresh_case_freshness(&mut battery, cached_case);
+                    precise_battery = Some(battery);
                     // ส่งค่าซ้ำเพื่อ refresh อายุข้อมูลใน kernel bridge แม้ D-Bus snapshot ไม่เปลี่ยน
                     publish_battery(&state, &events, &bridge, battery).await;
-                } else if is_device_connected == Some(true) && !scan_in_progress {
-                    spawn_battery_scan(&scan_results_tx);
+                } else if selected_connected(&selected_connection) == Some(true) && !scan_in_progress {
+                    scan_generation = scan_generation.wrapping_add(1);
+                    spawn_battery_scan(&scan_results_tx, scan_generation);
                     scan_in_progress = true;
+                } else if selected_connected(&selected_connection) != Some(true) && cached_case.is_some() {
+                    // ต่ออายุ UPower device ด้วยค่า last known แม้เคสและหูฟังไม่ได้เชื่อมต่ออยู่
+                    publish_battery(
+                        &state,
+                        &events,
+                        &bridge,
+                        cached_case_status(cached_case, true),
+                    )
+                    .await;
                 }
             }
         }
@@ -229,25 +288,53 @@ pub async fn battery_loop(
 }
 
 /// แยก BLE scan เป็น task เพื่อไม่ให้ event loop หยุดรับ AACP หรือ shutdown ระหว่าง scan
-fn spawn_battery_scan(results: &mpsc::UnboundedSender<Result<AirPodsBattery, String>>) {
+fn spawn_battery_scan(
+    results: &mpsc::UnboundedSender<(u64, Result<AirPodsBattery, String>)>,
+    generation: u64,
+) {
     let results = results.clone();
     tokio::spawn(async move {
-        let _ = results.send(scan_airpods_battery().await);
+        let _ = results.send((generation, scan_airpods_battery().await));
     });
 }
 
-/// แปลง battery model จาก core เป็น IPC model โดยใช้ `-1` แทน percent ที่ไม่มีข้อมูล
-fn battery_status(battery: AirPodsBattery) -> BatteryStatus {
-    BatteryStatus {
+/// คืน address ของ connection snapshot หรือสตริงว่างเมื่อ inventory ยังไม่พร้อม
+fn selected_address(connection: &Option<SelectedDeviceConnection>) -> &str {
+    connection
+        .as_ref()
+        .map(|connection| connection.address.as_str())
+        .unwrap_or_default()
+}
+
+/// คืน connection state โดยคง `None` ไว้จนกว่า inventory worker จะอ่าน BlueZ สำเร็จ
+fn selected_connected(connection: &Option<SelectedDeviceConnection>) -> Option<bool> {
+    connection
+        .as_ref()
+        .map(|connection| connection.connected)
+}
+
+/// แปลง battery model จาก BLE เป็น IPC model พร้อมรักษาค่าเคสล่าสุดเมื่อ packet ไม่รายงานเคส
+fn battery_status(
+    battery: AirPodsBattery,
+    cached_case: &mut Option<CachedCase>,
+) -> BatteryStatus {
+    let mut status = BatteryStatus {
         left_percent: battery.left.percent.map(i16::from).unwrap_or(-1),
         left_charging: battery.left.charging,
         right_percent: battery.right.percent.map(i16::from).unwrap_or(-1),
         right_charging: battery.right.charging,
-    }
+        ..BatteryStatus::unavailable()
+    };
+    apply_case_level(&mut status, battery.case, cached_case);
+    status
 }
 
-/// รวม partial AACP update ลง snapshot เดิมและคงค่าของข้างที่ไม่ได้มากับ notification
-fn apply_aacp_update(battery: &mut BatteryStatus, update: AacpBatteryUpdate) {
+/// รวม partial AACP update ลง snapshot เดิมและคง component ที่ไม่ได้มากับ notification
+fn apply_aacp_update(
+    battery: &mut BatteryStatus,
+    update: AacpBatteryUpdate,
+    cached_case: &mut Option<CachedCase>,
+) {
     if let Some(left) = update.left {
         apply_level(&mut battery.left_percent, &mut battery.left_charging, left);
     }
@@ -258,12 +345,67 @@ fn apply_aacp_update(battery: &mut BatteryStatus, update: AacpBatteryUpdate) {
             right,
         );
     }
+    if let Some(charging_case) = update.case {
+        apply_case_level(battery, charging_case, cached_case);
+    }
 }
 
 /// แปลง battery level หนึ่งข้างเป็นค่า percent และ charging ของ IPC
 fn apply_level(percent: &mut i16, charging: &mut bool, level: BatteryLevel) {
     *percent = level.percent.map(i16::from).unwrap_or(-1);
     *charging = level.charging;
+}
+
+/// ใช้ค่าจริงของเคสอัปเดต cache หรือคงค่าก่อนหน้าเป็น last known เมื่อเคสรายงาน unavailable
+fn apply_case_level(
+    battery: &mut BatteryStatus,
+    level: BatteryLevel,
+    cached_case: &mut Option<CachedCase>,
+) {
+    if let Some(percent) = level.percent {
+        let cached = CachedCase {
+            percent: i16::from(percent),
+            charging: level.charging,
+            observed_at: Instant::now(),
+        };
+        *cached_case = Some(cached);
+        battery.case_percent = cached.percent;
+        battery.case_charging = cached.charging;
+        battery.case_stale = false;
+    } else {
+        apply_cached_case(battery, *cached_case, true);
+    }
+}
+
+/// คืน snapshot ที่ซ่อนหูฟังทั้งสองข้างแต่ยังเผยแพร่ค่าเคสล่าสุดได้
+fn cached_case_status(cached_case: Option<CachedCase>, force_stale: bool) -> BatteryStatus {
+    let mut battery = BatteryStatus::unavailable();
+    apply_cached_case(&mut battery, cached_case, force_stale);
+    battery
+}
+
+/// เติมค่าเคสจาก cache และทำเครื่องหมาย stale ตามอายุหรือสถานะ connection
+fn apply_cached_case(
+    battery: &mut BatteryStatus,
+    cached_case: Option<CachedCase>,
+    force_stale: bool,
+) {
+    let Some(cached_case) = cached_case else {
+        battery.case_percent = -1;
+        battery.case_charging = false;
+        battery.case_stale = true;
+        return;
+    };
+    battery.case_percent = cached_case.percent;
+    battery.case_charging = cached_case.charging;
+    battery.case_stale = force_stale || cached_case.observed_at.elapsed() >= CASE_FRESH_TIMEOUT;
+}
+
+/// เปลี่ยนค่าเคสเป็น last known เมื่อเลยช่วง freshness โดยไม่ล้างเปอร์เซ็นต์ที่ยังมีประโยชน์
+fn refresh_case_freshness(battery: &mut BatteryStatus, cached_case: Option<CachedCase>) {
+    let was_stale = battery.case_stale;
+    apply_cached_case(battery, cached_case, false);
+    battery.case_stale |= was_stale;
 }
 
 /// เขียน battery ไป kernel bridge แล้วเผยแพร่เฉพาะ D-Bus snapshots ที่เปลี่ยน

@@ -40,7 +40,7 @@ impl PowerBridge {
         self.update(BatteryStatus::unavailable()).await
     }
 
-    /// เข้ารหัสสถานะ left และ right เป็น payload 7 bytes แล้วเขียนไปยัง kernel bridge
+    /// เข้ารหัสสถานะ left, right และ case เป็น payload protocol 2 แล้วเขียนไปยัง kernel bridge
     pub async fn update(&self, battery: BatteryStatus) -> io::Result<UpdateOutcome> {
         let mut device = match tokio::fs::OpenOptions::new().write(true).open(&self.path).await {
             Ok(device) => device,
@@ -49,15 +49,20 @@ impl PowerBridge {
             }
             Err(error) => return Err(error),
         };
-        // byte แรกคือ protocol version ตามด้วย available, percent และ charging ของแต่ละข้าง
+        // byte แรกคือ protocol version ตามด้วย present, percent และ charging ของแต่ละก้อน
+        // ส่วนเคสมี stale เพิ่มเพื่อให้ UPower แสดงค่า cache โดยไม่อ้างว่าเป็นสถานะปัจจุบัน
         let payload = [
-            1,
+            2,
             u8::from(battery.left_percent >= 0),
             percent_byte(battery.left_percent),
             u8::from(battery.left_charging),
             u8::from(battery.right_percent >= 0),
             percent_byte(battery.right_percent),
             u8::from(battery.right_charging),
+            u8::from(battery.case_percent >= 0),
+            percent_byte(battery.case_percent),
+            u8::from(battery.case_charging),
+            u8::from(battery.case_stale),
         ];
         device.write_all(&payload).await?;
         Ok(UpdateOutcome::Written)

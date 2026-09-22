@@ -62,7 +62,7 @@ pub struct DeviceInfo {
     pub selected: bool,
 }
 
-/// ค่าแบตเตอรี่ที่อ่านได้จากหูฟังแต่ละข้าง
+/// ค่าแบตเตอรี่ที่อ่านได้จากหูฟังแต่ละข้างและเคสชาร์จ
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Type)]
 pub struct BatteryStatus {
     /// ใช้ `-1` เมื่อยังไม่มีค่าจากอุปกรณ์
@@ -73,6 +73,12 @@ pub struct BatteryStatus {
     pub right_percent: i16,
     /// ระบุว่า AirPod ข้างขวากำลังชาร์จอยู่หรือไม่
     pub right_charging: bool,
+    /// ใช้ `-1` เมื่อยังไม่เคยได้รับค่าแบตเตอรี่เคส
+    pub case_percent: i16,
+    /// ระบุว่าเคสกำลังชาร์จตามข้อมูลล่าสุดหรือไม่
+    pub case_charging: bool,
+    /// ระบุว่าค่าเคสเป็นค่าล่าสุดที่ cache ไว้เพราะเคสไม่ได้ส่งข้อมูลอยู่
+    pub case_stale: bool,
 }
 
 impl BatteryStatus {
@@ -83,6 +89,9 @@ impl BatteryStatus {
             left_charging: false,
             right_percent: -1,
             right_charging: false,
+            case_percent: -1,
+            case_charging: false,
+            case_stale: true,
         }
     }
 }
@@ -118,7 +127,7 @@ pub trait Manager {
     /// ส่งชื่อ listening mode ให้ daemon แปลงเป็นคำสั่ง AACP
     fn set_listening_mode(&self, mode: &str) -> zbus::Result<()>;
 
-    /// อ่านค่าแบตเตอรี่ล่าสุดของ AirPods ทั้งสองข้าง
+    /// อ่านค่าแบตเตอรี่ล่าสุดของ AirPods ทั้งสองข้างและเคสชาร์จ
     fn battery(&self) -> zbus::Result<BatteryStatus>;
 
     /// แจ้ง client เมื่อ state หรือ audio setting ของ daemon เปลี่ยน

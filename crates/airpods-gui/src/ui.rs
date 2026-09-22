@@ -41,6 +41,8 @@ struct View {
     left: BatteryView,
     /// widget แบตเตอรี่ของ AirPod ข้างขวา
     right: BatteryView,
+    /// widget แบตเตอรี่ของเคสชาร์จ
+    charging_case: BatteryView,
     /// badge ที่แสดงความพร้อมของ UPower bridge
     power_bridge: gtk::Label,
     /// container ที่ซ่อนหรือเปิด error banner ด้วย transition
@@ -52,7 +54,7 @@ struct View {
 }
 
 #[derive(Clone)]
-/// widget คู่ที่แสดงค่าแบตเตอรี่หนึ่งข้างทั้งตัวเลขและแถบระดับ
+/// widget คู่ที่แสดงค่าแบตเตอรี่หนึ่งก้อนทั้งตัวเลขและแถบระดับ
 struct BatteryView {
     /// ข้อความร้อยละและเครื่องหมายชาร์จ
     value: gtk::Label,
@@ -130,7 +132,7 @@ fn build_content(client: &Client) -> (gtk::Box, View) {
         build_microphone_section(client, &updating);
     root.append(&microphone);
 
-    let (battery, left, right, power_bridge) = build_battery_section();
+    let (battery, left, right, charging_case, power_bridge) = build_battery_section();
     root.append(&battery);
 
     connect_device_selection(&device_combo, client, &updating);
@@ -148,6 +150,7 @@ fn build_content(client: &Client) -> (gtk::Box, View) {
             limiter_spin,
             left,
             right,
+            charging_case,
             power_bridge,
             error_revealer,
             error_label,
@@ -284,8 +287,14 @@ fn build_microphone_section(
     (section, card, mic_switch, gain_spin, limiter_spin)
 }
 
-/// สร้างส่วนแบตเตอรี่สองข้างและ badge ของ UPower bridge
-fn build_battery_section() -> (gtk::Box, BatteryView, BatteryView, gtk::Label) {
+/// สร้างส่วนแบตเตอรี่สองข้าง เคสชาร์จ และ badge ของ UPower bridge
+fn build_battery_section() -> (
+    gtk::Box,
+    BatteryView,
+    BatteryView,
+    BatteryView,
+    gtk::Label,
+) {
     let (section, card) = settings_section("Battery");
 
     let (left_control, left) = battery_control();
@@ -304,15 +313,23 @@ fn build_battery_section() -> (gtk::Box, BatteryView, BatteryView, gtk::Label) {
     ));
     card.append(&settings_separator());
 
+    let (case_control, charging_case) = battery_control();
+    card.append(&setting_row(
+        "Charging Case",
+        "Last reported level is retained while the closed case is offline.",
+        &case_control,
+    ));
+    card.append(&settings_separator());
+
     let power_bridge = gtk::Label::new(Some("WAITING"));
     power_bridge.set_css_classes(&["status-pill", "state-warn"]);
     card.append(&setting_row(
         "UPower bridge",
-        "Publishes both earbuds as battery devices in Ubuntu.",
+        "Publishes both earbuds and the charging case in Ubuntu.",
         &power_bridge,
     ));
 
-    (section, left, right, power_bridge)
+    (section, left, right, charging_case, power_bridge)
 }
 
 /// สร้างโครง section มาตรฐานที่มีหัวข้อและ card สำหรับวาง setting row
@@ -374,7 +391,7 @@ fn numeric_control(minimum: f64, maximum: f64, step: f64) -> gtk::SpinButton {
     control
 }
 
-/// สร้าง widget แบตเตอรี่หนึ่งข้างและคืน handle สำหรับอัปเดตค่าภายหลัง
+/// สร้าง widget แบตเตอรี่หนึ่งก้อนและคืน handle สำหรับอัปเดตค่าภายหลัง
 fn battery_control() -> (gtk::Box, BatteryView) {
     let control = gtk::Box::new(Orientation::Vertical, 5);
     control.set_css_classes(&["battery-control"]);
@@ -419,13 +436,25 @@ fn attach_event_receiver(view: View, events: mpsc::Receiver<Event>) {
                 } => {
                     update_devices(&view, &devices, &status.selected_device);
                     update_status(&view, &status);
-                    update_battery(&view.left, battery.left_percent, battery.left_charging);
-                    update_battery(&view.right, battery.right_percent, battery.right_charging);
+                    update_battery(&view.left, battery.left_percent, battery.left_charging, false);
+                    update_battery(&view.right, battery.right_percent, battery.right_charging, false);
+                    update_battery(
+                        &view.charging_case,
+                        battery.case_percent,
+                        battery.case_charging,
+                        battery.case_stale,
+                    );
                 }
                 Event::Status(status) => update_status(&view, &status),
                 Event::Battery(battery) => {
-                    update_battery(&view.left, battery.left_percent, battery.left_charging);
-                    update_battery(&view.right, battery.right_percent, battery.right_charging);
+                    update_battery(&view.left, battery.left_percent, battery.left_charging, false);
+                    update_battery(&view.right, battery.right_percent, battery.right_charging, false);
+                    update_battery(
+                        &view.charging_case,
+                        battery.case_percent,
+                        battery.case_charging,
+                        battery.case_stale,
+                    );
                 }
                 Event::Devices(devices) => {
                     // รักษาค่าที่ combo เลือกไว้ หาก signal ชุดใหม่ยังมี address เดิม
@@ -529,8 +558,8 @@ fn update_status(view: &View, status: &DaemonStatus) {
     }
 }
 
-/// แสดงค่าแบตเตอรี่ที่ valid หรือคืน widget สู่สถานะไม่มีข้อมูล
-fn update_battery(view: &BatteryView, percent: i16, charging: bool) {
+/// แสดงค่าแบตเตอรี่ที่ valid พร้อมแยกค่า last known ออกจาก measurement ปัจจุบัน
+fn update_battery(view: &BatteryView, percent: i16, charging: bool, stale: bool) {
     // D-Bus contract ใช้ค่าติดลบแทนค่าแบตเตอรี่ที่ยังไม่พร้อม
     if percent < 0 {
         view.value.set_text("—");
@@ -541,12 +570,21 @@ fn update_battery(view: &BatteryView, percent: i16, charging: bool) {
 
     // จำกัดค่าก่อนส่งให้ ProgressBar เพื่อป้องกันข้อมูลผิดช่วงกระทบการแสดงผล
     let percent = percent.clamp(0, 100);
-    let charging_mark = if charging { "⚡ " } else { "" };
-    view.value.set_text(&format!("{charging_mark}{percent}%"));
+    let charging_mark = if charging && !stale { "⚡ " } else { "" };
+    let stale_mark = if stale { " · LAST KNOWN" } else { "" };
+    view.value
+        .set_text(&format!("{charging_mark}{percent}%{stale_mark}"));
     view.bar.set_fraction(f64::from(percent) / 100.0);
-    let charging_state = if charging { ", charging" } else { "" };
-    view.bar
-        .set_tooltip_text(Some(&format!("Battery level: {percent}%{charging_state}")));
+    let detail = if stale {
+        "last reported; the case is not currently sending battery data"
+    } else if charging {
+        "charging"
+    } else {
+        "current reading"
+    };
+    view.bar.set_tooltip_text(Some(&format!(
+        "Battery level: {percent}% ({detail})"
+    )));
 }
 
 /// เปลี่ยนข้อความและแทนที่สีสถานะเดิมของ badge ด้วย class ใหม่เพียงค่าเดียว
