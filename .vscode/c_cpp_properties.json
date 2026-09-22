@@ -1,0 +1,25 @@
+{
+    "configurations": [
+        {
+            "name": "Linux",
+            "includePath": [
+                "${workspaceFolder}/crates/airpods-audio/native",
+                "${workspaceFolder}/third_party/fdk-aac/libAACdec/include",
+                "${workspaceFolder}/third_party/fdk-aac/libSYS/include",
+                "/usr/include/pipewire-0.3",
+                "/usr/include/spa-0.2"
+            ],
+            "defines": [
+                "_REENTRANT"
+            ],
+            "compilerPath": "/usr/bin/g++",
+            "compilerArgs": [
+                "-pthread"
+            ],
+            "cStandard": "c17",
+            "cppStandard": "c++20",
+            "intelliSenseMode": "linux-gcc-x64"
+        }
+    ],
+    "version": 4
+}
