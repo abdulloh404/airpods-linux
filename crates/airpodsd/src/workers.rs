@@ -161,12 +161,14 @@ pub async fn battery_loop(
                     }
                 } else {
                     precise_battery = None;
+                    // ค่าเคสจาก cache ใช้ได้เฉพาะ connection เดิม; เมื่อหลุดต้องลบจาก UPower ทันที
+                    cached_case = None;
                     consecutive_failures = 0;
                     publish_battery(
                         &state,
                         &events,
                         &bridge,
-                        cached_case_status(cached_case, true),
+                        BatteryStatus::unavailable(),
                     )
                     .await;
                 }
@@ -204,7 +206,7 @@ pub async fn battery_loop(
                                 &state,
                                 &events,
                                 &bridge,
-                                cached_case_status(cached_case, true),
+                                BatteryStatus::unavailable(),
                             )
                             .await;
                         }
@@ -222,7 +224,7 @@ pub async fn battery_loop(
                                 &state,
                                 &events,
                                 &bridge,
-                                cached_case_status(cached_case, true),
+                                BatteryStatus::unavailable(),
                             )
                             .await;
                         }
@@ -269,15 +271,6 @@ pub async fn battery_loop(
                     scan_generation = scan_generation.wrapping_add(1);
                     spawn_battery_scan(&scan_results_tx, scan_generation);
                     scan_in_progress = true;
-                } else if selected_connected(&selected_connection) != Some(true) && cached_case.is_some() {
-                    // ต่ออายุ UPower device ด้วยค่า last known แม้เคสและหูฟังไม่ได้เชื่อมต่ออยู่
-                    publish_battery(
-                        &state,
-                        &events,
-                        &bridge,
-                        cached_case_status(cached_case, true),
-                    )
-                    .await;
                 }
             }
         }
